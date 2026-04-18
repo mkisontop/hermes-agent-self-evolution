@@ -32,3 +32,4 @@ proposals/
 
 # OS
 .DS_Store
+usage/skill_usage_log.jsonl
