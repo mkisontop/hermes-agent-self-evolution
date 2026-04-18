@@ -22,10 +22,26 @@ LOG_PATH = Path(__file__).resolve().parent / "skill_usage_log.jsonl"
 
 
 def snapshot_db():
+    """Backup state.db safely — uses SQLite Online Backup API so WAL is merged
+    and we don't race with active writers. Falls back to file copy only if
+    the source DB doesn't exist."""
     if not HERMES_DB.exists():
         print(f"[tracker] FATAL: {HERMES_DB} missing", file=sys.stderr)
         sys.exit(2)
-    shutil.copy2(HERMES_DB, SNAPSHOT_DB)
+    # Remove stale snapshot (and any -wal/-shm siblings)
+    for p in (SNAPSHOT_DB, Path(str(SNAPSHOT_DB) + "-wal"), Path(str(SNAPSHOT_DB) + "-shm")):
+        if p.exists():
+            p.unlink()
+    try:
+        src = sqlite3.connect(f"file:{HERMES_DB}?mode=ro", uri=True, timeout=30.0)
+        dst = sqlite3.connect(SNAPSHOT_DB)
+        with dst:
+            src.backup(dst)
+        src.close()
+        dst.close()
+    except sqlite3.Error as e:
+        print(f"[tracker] sqlite backup failed ({e}); falling back to file copy", file=sys.stderr)
+        shutil.copy2(HERMES_DB, SNAPSHOT_DB)
     return SNAPSHOT_DB
 
 
