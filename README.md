@@ -1,240 +1,316 @@
 # 🧬 Hermes Agent Self-Evolution
 
-**Evolutionary self-improvement for [Hermes Agent](https://github.com/NousResearch/hermes-agent).**
+**A proposal-first, safety-hardened self-improvement engine for [Hermes Agent](https://github.com/mkisontop/hermes-agent).**
 
-Hermes Agent Self-Evolution uses [DSPy](https://github.com/stanfordnlp/dspy) + [GEPA](https://github.com/gepa-ai/gepa) (Genetic-Pareto Prompt Evolution) to automatically evolve and optimize Hermes Agent's skills, tool descriptions, system prompts, and code — producing measurably better versions through reflective evolutionary search.
+This engine evolves Hermes skills using **DSPy + MIPROv2**, evaluates candidates on holdout data, writes proposals with integrity manifests, and only ever writes back through an explicitly hardened reviewer path.
 
-**No GPU training required.** Everything operates via API calls — mutating text, evaluating results, and selecting the best variants. ~$2–10 per optimization run.
+It is now designed to be used as a **nightly proposal engine** first, and only later as a cautious auto-merge engine once additional trust-building gates are added.
 
 ---
 
-## How It Works
+## Current Operating Mode
 
-```
-Read current skill/prompt/tool ──► Generate eval dataset
-                                        │
-                                        ▼
-                                   GEPA Optimizer ◄── Execution traces
-                                        │                    ▲
-                                        ▼                    │
-                                   Candidate variants ──► Evaluate
-                                        │
-                                   Constraint gates (tests, size limits, regression)
-                                        │
-                                        ▼
-                     Best variant ──► Proposal (review queue) ──► Human approves ──► PR
+### Ready now
+- ✅ nightly proposal generation
+- ✅ manual proposal review
+- ✅ hardened manual approval / write-back path
+- ✅ MIPRO production path
+- ✅ judge containment
+- ✅ manifest hashes + stale-baseline guard
+- ✅ atomic write-back safety
+- ✅ risk tiers
+- ✅ nightly digest generation
+
+### Not enabled yet
+- ❌ unattended real auto-merge by default
+
+This is intentional.
+
+The current engine is strong for **proposal generation and manual approval**, but real unattended auto-merge should stay off until the next safety batch (paired-win, dry-run, quarantine, nightly merge budget, low-risk-only real merge) is implemented and validated.
+
+---
+
+## Safety Model
+
+This repo now has three layers of safety.
+
+### Batch A — foundation hardening
+- dependency lock with hashes (`requirements.lock`)
+- self-evolution hard-block / denylist
+- doctor checks for routing, packages, scheduler, self-block, faulthandler, live pings
+- production model routing:
+  - `codex-spark` = optimizer / proposer / reflection / task
+  - `gpt-5.4` = judge / eval only
+- `faulthandler` before `SIGALRM`
+
+### A-prime — judge containment
+- role-aware LM factory (`task`, `optimizer`, `judge`)
+- judge-only timeout / retries / token caps
+- judge phase timeout
+- judge canary via `python -m evolution.doctor_config --judge-canary <skill>`
+- proposal preserved when judge fails (`judge_failed=true`, `auto_merge=false`)
+
+### Batch B — approval/write-back hardening
+- `manifest.json` with SHA256 of baseline / evolved / diff
+- stale-baseline approval guard
+- tampered-artifact guard
+- risk tiers (`low`, `medium`, `high`, `critical`)
+- root guard + symlink refusal + same-device atomic write
+- rollback-capable write-back path
+- reviewer-side refusal codes and force-flag separation
+
+---
+
+## Architecture
+
+```text
+skill text
+  -> synthetic / imported eval dataset
+  -> MIPROv2 optimization (proposal-first)
+  -> holdout judge scoring
+  -> AutoMergeGate decision
+  -> proposal bundle + manifest
+  -> human review via proposal_reviewer
+  -> hardened write_back_skill path (only when approved)
 ```
 
-GEPA reads execution traces to understand *why* things fail (not just that they failed), then proposes targeted improvements. ICLR 2026 Oral, MIT licensed.
+Everything is built around the principle:
+
+> **Generate proposals first. Review before live writes.**
+
+---
+
+## Key Files
+
+### Core engine
+- `evolution/skills/evolve_skill.py` — main optimization pipeline
+- `evolution/core/lm_factory.py` — role-aware LM construction
+- `evolution/core/regression_guard.py` — gate decision logic
+- `evolution/core/manifest.py` — proposal integrity hashes
+- `evolution/core/risk.py` — risk tier policy
+- `evolution/core/write_back.py` — hardened live write-back
+- `evolution/review/proposal_reviewer.py` — human approval / reject CLI
+- `evolution/review/digest.py` — proposal digest generation
+- `evolution/doctor_config.py` — health and routing verification
+
+### Runtime state
+- `logs/` — nightly / evolve / smoke / digest logs
+- `proposals/<skill>/<timestamp>/` — reviewable proposals
+- `output/<skill>/<timestamp>/` — raw run artifacts
+- `state/` — reserved for future runtime state (Batch C)
+
+---
+
+## Model Routing Policy
+
+Current safe routing is:
+
+- **Optimizer / proposer / reflection / task:** `openai/cx/gpt-5.3-codex-spark`
+- **Judge / eval:** `openai/cx/gpt-5.4`
+
+Do **not** switch `gpt-5.4` back into proposer/optimizer roles by default.
+
+That path was explicitly separated because proposer-shaped prompts were the unstable part of the earlier system.
 
 ---
 
 ## Quick Start
 
 ```bash
-# Install
-git clone https://github.com/NousResearch/hermes-agent-self-evolution.git
-cd hermes-agent-self-evolution
-python -m venv venv && source venv/bin/activate
-pip install -e ".[dev]"
-
-# Point at your hermes-agent repo
-export HERMES_AGENT_REPO=~/.hermes/hermes-agent
-
-# Dry-run a skill (no LLM cost, confirms plumbing)
-python -m evolution.skills.evolve_skill \
-    --skill github-code-review \
-    --dry-run --mode propose \
-    --optimizer-model openai/cx/gpt-5.4 \
-    --eval-model openai/cx/gpt-5.4
-
-# Real propose-mode run (writes proposal for human review)
-python -m evolution.skills.evolve_skill \
-    --skill github-code-review \
-    --iterations 10 \
-    --mode propose \
-    --optimizer-model openai/cx/gpt-5.4 \
-    --eval-model openai/cx/gpt-5.4
+cd ~/.hermes/self-evolution
+source venv/bin/activate
+python -m evolution.doctor_config --live
 ```
 
----
+If all green, start using the engine in **proposal mode**.
 
-## Modes
-
-| Mode | Behavior | When to use |
-|------|----------|-------------|
-| `propose` *(default, safe)* | Writes a candidate to `proposals/` for human review. Never touches source files. | Nightly cron, routine evolution |
-| `auto` | Auto-merges the candidate if it beats baseline and passes all gates. Writes timestamped `.bak` backup before overwriting. | Only when you trust the metric |
-| `--dry-run` | Exits before any LLM call. Validates CLI, skill discovery, frontmatter, proposals dir. ~2s, zero tokens. | Smoke testing, CI |
-
----
-
-## Nightly Workflow
-
-`nightly.sh` runs three phases end-to-end, logged to `logs/nightly-<ts>.log`:
-
-1. **Smoke preflight** — `bash smoke_test.sh t1 + t5` (~10s, zero tokens).
-   Fails fast if CLI, skill discovery, or frontmatter is broken.
-2. **Evolve** — runs `evolve_skill` in the configured mode (default `propose`).
-   Emits proposal to `proposals/<skill>-<ts>/`.
-3. **Digest** — `evolution.review.digest` builds a human-readable markdown
-   summary of all proposals in the last 24h to `logs/digests/YYYY-MM-DD.md`.
-   Offline, deterministic, no LLM calls.
-
-**Environment variables:**
-
-| Var | Default | Purpose |
-|-----|---------|---------|
-| `SKILL` | _top-3 from usage picker_ | Target skill slug (overrides picker) |
-| `ITERATIONS` | `10` | GEPA generations / MIPRO trials budget |
-| `MODE` | `propose` | `propose` \| `auto` |
-| `EVOLUTION_OPTIMIZER_MODEL` | `openai/cx/gpt-5.3-codex-spark` | Optimizer / proposer / reflection LLM |
-| `EVOLUTION_EVAL_MODEL` | `openai/cx/gpt-5.4` | Judge / before-after eval LLM |
-| `EVOLUTION_TASK_MODEL` | `openai/cx/gpt-5.3-codex-spark` | Task rollout LLM |
-| `EVOLUTION_AUTO_OPTIMIZER` | _(unset)_ | Force `gepa` or `miprov2` when `--optimizer auto` |
-| `EVOLUTION_LM_NUM_RETRIES` | `0` | LM retry count (0 to surface hangs immediately) |
-| `DIGEST_WINDOW_HOURS` | `24` | Digest lookback window |
-| `SKIP_SMOKE` | `` | Set `1` to skip phase 1 |
-| `SKIP_EVOLVE` | _auto under cron_ | `1` = digest-only; `ALLOW_EVOLVE=1` to force evolve under cron |
-| `SKIP_DIGEST` | `` | Set `1` to skip phase 3 |
-
-**Schedule:**
+### One supervised top-1 run
 
 ```bash
-# Cron (Asia/Tehran, 07:00 local)
-0 7 * * * cd ~/.hermes/self-evolution && bash nightly.sh
+cd ~/.hermes/self-evolution
+
+ALLOW_EVOLVE=1 \
+SKIP_EVOLVE=0 \
+SKILL=writing-plans \
+OPTIMIZER=mipro \
+EVOLUTION_AUTO_MERGE=0 \
+./nightly.sh
 ```
 
----
+Expected:
+- smoke passes
+- proposal written
+- manifest written
+- digest written
+- live skill untouched
 
-## Reviewing Proposals
-
-Every propose-mode run writes a proposal bundle to
-`proposals/{skill_name}/{YYYYMMDD_HHMMSS}/` containing:
-
-- `baseline_skill.md` — original skill text
-- `evolved_skill.md` — reassembled evolved skill
-- `diff.patch` — unified diff
-- `decision.json` — gate decision + scores + delta
-- `constraints.json` — per-constraint results
-- `review.md` — human-readable summary
-- `STATUS` — `PENDING` | `APPROVED` | `REJECTED`
-
-Use the `ProposalReviewer` CLI to triage:
+### Daily review loop
 
 ```bash
-# List all pending proposals (status + delta)
+cd ~/.hermes/self-evolution
+python -m evolution.doctor_config
 python -m evolution.review.proposal_reviewer list
-
-# Show a specific proposal (prints review.md)
-python -m evolution.review.proposal_reviewer show github-code-review 20260418_171916
-
-# View the full diff
-python -m evolution.review.proposal_reviewer diff github-code-review 20260418_171916
-
-# Approve (writes evolved skill back to hermes-agent; timestamped .bak)
-python -m evolution.review.proposal_reviewer approve github-code-review 20260418_171916
-
-# Reject (marks STATUS=REJECTED, optional reason)
-python -m evolution.review.proposal_reviewer reject github-code-review 20260418_171916 --reason "too verbose"
+cat logs/digests/$(date +%F).md
 ```
 
-Approval reuses `write_back_skill(..., mode='auto', auto_merge=True)` so the
-atomic overwrite + `.bak` safety path is identical to `auto` mode runs.
-
----
-
-## Smoke Tiers
-
-`smoke_test.sh` has five tiers — run subsets depending on what you're
-validating:
-
-| Tier | What it checks | Cost | Time |
-|------|----------------|------|------|
-| **t1** | Dry-run on top 5 skills — CLI, skill discovery | 0 tokens | ~8s |
-| **t2** | Dataset builder end-to-end | 0 tokens | ~2s |
-| **t3** | Constraint validator (size, frontmatter, drift) | 0 tokens | ~1s |
-| **t4** | Full GEPA optimization + regression eval on one skill | ~$0.30 | ~4min |
-| **t5** | Propose-mode structural (dry-run, proposals dir writable) | 0 tokens | ~2s |
+Inspect a proposal:
 
 ```bash
-bash smoke_test.sh           # default: t1 + t5 (zero-token, ~10s)
-bash smoke_test.sh full      # all tiers including t4 (hits LLM)
-bash smoke_test.sh t5        # single tier
+python -m evolution.review.proposal_reviewer show writing-plans 20260422_153011
+python -m evolution.review.proposal_reviewer diff writing-plans 20260422_153011
 ```
 
-The default `bash smoke_test.sh` is what nightly cron runs. Use `full`
-weekly or before a release to exercise the expensive t4 path.
+Approve only through the reviewer:
 
----
-
-## What It Optimizes
-
-| Phase | Target | Engine | Status |
-|-------|--------|--------|--------|
-| **Phase 1** | Skill files (`SKILL.md`) | DSPy + GEPA | ✅ Implemented |
-| **Phase 2** | Tool descriptions | DSPy + GEPA | 🔲 Planned |
-| **Phase 3** | System prompt sections | DSPy + GEPA | 🔲 Planned |
-| **Phase 4** | Tool implementation code | Darwinian Evolver | 🔲 Planned |
-| **Phase 5** | Continuous improvement loop | Automated pipeline | 🔲 Planned |
-
----
-
-## Engines
-
-| Engine | What It Does | License |
-|--------|-------------|---------|
-| **[DSPy](https://github.com/stanfordnlp/dspy) + [GEPA](https://github.com/gepa-ai/gepa)** | Reflective prompt evolution — reads execution traces, proposes targeted mutations | MIT |
-| **[Darwinian Evolver](https://github.com/imbue-ai/darwinian_evolver)** | Code evolution with Git-based organisms | AGPL v3 (external CLI only) |
-
----
-
-## Guardrails
-
-Every evolved variant must pass:
-
-1. **Full test suite** — `pytest tests/ -q` must pass 100% (218 tests).
-2. **Size limits** — Skills ≤15KB, tool descriptions ≤500 chars.
-3. **Frontmatter validation** — YAML front-matter preserved and valid.
-4. **Semantic preservation** — Name/description slugs unchanged.
-5. **Regression gate** — In `auto` mode, candidate must beat baseline on
-   held-out eval set. In `propose` mode, regression does NOT fail the run —
-   writing a proposal for review is the success path.
-6. **Backups** — `auto` mode writes a timestamped `.bak` before overwrite.
-7. **Human review** — `propose` mode requires explicit approval via the
-   `ProposalReviewer` CLI.
-
----
-
-## Documentation
-
-- **[PLAN.md](PLAN.md)** — Full architecture plan, roadmap, design decisions.
-- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — Module map, data flow, extension points.
-- **[docs/OPERATIONS.md](docs/OPERATIONS.md)** — Runbook: nightly cron, proposal review, troubleshooting.
-
----
-
-## Layout
-
-```
-self-evolution/
-├── evolution/
-│   ├── core/            # Config, constraints, datasets, fitness, proposals, regression, write-back
-│   ├── skills/          # Phase 1: skill evolver (evolve_skill.py, skill_module.py)
-│   ├── review/          # Proposal reviewer CLI + nightly digest
-│   ├── prompts/         # Phase 3 (planned)
-│   ├── tools/           # Phase 2 (planned)
-│   ├── code/            # Phase 4 (planned)
-│   └── monitor/         # Phase 5 (planned)
-├── tests/               # 218 tests, all green
-├── smoke_test.sh        # 5-tier smoke harness
-├── nightly.sh           # 3-phase nightly orchestrator
-├── run_evolution.sh     # Legacy single-shot runner
-└── proposals/           # Proposal review queue (gitignored)
+```bash
+python -m evolution.review.proposal_reviewer approve writing-plans 20260422_153011
 ```
 
+Reject noisy ones:
+
+```bash
+python -m evolution.review.proposal_reviewer reject writing-plans 20260422_153011 --reason "not clearly better"
+```
+
+Never copy files by hand.
+
 ---
 
-## License
+## Nightly Mode
 
-MIT — © 2026 Nous Research
+The nightly pipeline is driven by `nightly.sh`.
+
+Default phases:
+1. smoke preflight (`t1` + `t5`)
+2. evolve selected skills in proposal mode
+3. build digest
+
+### Important defaults
+- `OPTIMIZER=mipro`
+- `EVOLUTION_FITNESS_MODE=fast`
+- `EVOLUTION_HOLDOUT_METRIC=judge`
+- `EVOLUTION_AUTO_MERGE=0`
+
+### Recommended current production posture
+
+```bash
+export ALLOW_EVOLVE=1
+export EVOLUTION_AUTO_MERGE=0
+export OPTIMIZER=mipro
+export EVOLUTION_FITNESS_MODE=fast
+export EVOLUTION_HOLDOUT_METRIC=judge
+```
+
+That means:
+- proposals are generated nightly
+- digests are written nightly
+- no live writes happen automatically
+
+---
+
+## Reviewing Proposal Quality
+
+A positive score delta alone is **not enough**.
+
+Good signs:
+- shorter or cleaner skill
+- improved ordering
+- more specific instructions
+- edge cases added without bloat
+- no safety loss
+- score stable or improved
+
+Bad signs:
+- large rewrite with tiny gain
+- verbosity without value
+- generic rules replacing precise guidance
+- important caveats removed
+- obvious overfitting to examples
+- frontmatter / structure degradation
+
+The current philosophy is:
+
+> **Read the diff. Then decide.**
+
+---
+
+## Approval Safety Guarantees
+
+When you approve through `proposal_reviewer`, the path now enforces:
+- live hash matches manifest baseline
+- evolved artifact hash matches manifest
+- risk tier is allowed
+- write target is inside allowed roots
+- no symlink escape
+- backup created before overwrite
+- atomic replace path
+- rollback-capable write-back
+
+After approval, always run:
+
+```bash
+pytest -q
+./smoke_test.sh t1
+./smoke_test.sh t5
+python -m evolution.doctor_config
+```
+
+Then confirm the backup exists:
+
+```bash
+find ~/.hermes/hermes-agent -path '*backups*' -type f | tail -20
+```
+
+---
+
+## Current Readiness
+
+A realistic rating right now:
+
+| Area | Rating |
+|------|-------:|
+| Nightly proposal generation | 8.5/10 |
+| Manual approval safety | 9/10 |
+| Write-back safety | 8.5–9/10 |
+| Model routing reliability | 8.5/10 |
+| Judge containment | 8/10 |
+| Fully unattended auto-merge | 6/10 (not enabled) |
+
+So yes — it is worth using now.
+
+But use it in the right mode:
+- **proposal-first**
+- **manual approval**
+- **no real unattended auto-merge yet**
+
+---
+
+## Roadmap: Next Batch
+
+The next engineering batch should add:
+- paired-win evaluation
+- severe-regression detection
+- auto-merge dry-run mode
+- quarantine after repeated failures
+- max one auto-merge per night
+- low-risk-only real auto-merge
+- digest would-merge / would-not-merge reasons
+
+That is what turns this from a:
+
+> nightly proposal engine
+
+into a:
+
+> cautious low-risk auto-merge engine
+
+Until then, manual approval is the correct mode.
+
+---
+
+## Status
+
+This repo is now a **serious self-evolution appliance**.
+
+It is no longer “experimental glue that sometimes proposes things.”
+It is a structured, proposal-first, risk-aware, reviewable engine designed to improve Hermes safely over time.
