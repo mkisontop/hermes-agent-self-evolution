@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Read",
+      "Grep",
+      "Glob",
+      "Bash(git status)",
+      "Bash(git status *)",
+      "Bash(git diff)",
+      "Bash(git diff *)",
+      "Bash(git log)",
+      "Bash(git log *)",
+      "Bash(git show *)",
+      "Bash(pytest -q)",
+      "Bash(./smoke_test.sh t1)",
+      "Bash(./smoke_test.sh t5)",
+      "Bash(python -m evolution.doctor_config)",
+      "Bash(python -m evolution.doctor_config --live)",
+      "Bash(python -m evolution.doctor_config --judge-canary *)",
+      "Bash(ls *)",
+      "Bash(find . -maxdepth *)",
+      "Bash(grep *)",
+      "Bash(rg *)",
+      "Bash(sed -n *)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./secrets/**)",
+      "Read(./config/credentials.json)",
+      "Read(./backups/**)",
+      "Read(./logs/**)",
+      "Read(./proposals/**/baseline_skill.md)",
+      "Read(./proposals/**/evolved_skill.md)",
+      "Read(~/.ssh/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.config/gh/**)",
+      "Read(~/.hermes/secrets/**)",
+      "Bash(env)",
+      "Bash(printenv *)",
+      "Bash(cat .env*)",
+      "Bash(cat */.env*)",
+      "Bash(security find-generic-password *)",
+      "Bash(rm -rf *)",
+      "Bash(sudo *)",
+      "Bash(chmod 777 *)",
+      "Bash(chown *)",
+      "Bash(git push *)",
+      "Bash(git reset --hard *)",
+      "Bash(git clean -fdx *)",
+      "Bash(curl * | sh *)",
+      "Bash(wget * | sh *)"
+    ]
+  },
+  "env": {
+    "CLAUDE_CODE_EFFORT_LEVEL": "max",
+    "CLAUDE_CODE_MAX_RETRIES": "1",
+    "CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY": "4",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "16384"
+  }
+}
