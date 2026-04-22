@@ -64,6 +64,9 @@ USAGE_DAYS="${USAGE_DAYS:-7}"
 ITERATIONS="${ITERATIONS:-10}"
 MODEL="${MODEL:-${EVOLUTION_OPTIMIZER_MODEL:-openai/cx/gpt-5.3-codex-spark}}"
 TASK_MODEL="${TASK_MODEL:-${EVOLUTION_TASK_MODEL:-openai/cx/gpt-5.3-codex-spark}}"
+# Eval / judge model is intentionally split from MODEL so the optimizer
+# (codex-spark) and the judge (gpt-5.4) can differ per Batch A model policy.
+EVAL_MODEL="${EVAL_MODEL:-${EVOLUTION_EVAL_MODEL:-${EVOLUTION_JUDGE_MODEL:-openai/cx/gpt-5.4}}}"
 MODE="${MODE:-propose}"
 OPTIMIZER="${OPTIMIZER:-auto}"
 OPTIMIZER_TIMEOUT="${OPTIMIZER_TIMEOUT:-900}"
@@ -136,7 +139,7 @@ else
     log "skill list: top-${TOP_N}/${USAGE_DAYS}d from usage picker → ${SKILL_LIST[*]}"
 fi
 
-log "iters=$ITERATIONS mode=$MODE model=$MODEL task_model=$TASK_MODEL optimizer=$OPTIMIZER timeout=${OPTIMIZER_TIMEOUT}s run_timeout=${RUN_TIMEOUT}s window=${WINDOW_HOURS}h"
+log "iters=$ITERATIONS mode=$MODE model=$MODEL task_model=$TASK_MODEL eval_model=$EVAL_MODEL optimizer=$OPTIMIZER timeout=${OPTIMIZER_TIMEOUT}s run_timeout=${RUN_TIMEOUT}s window=${WINDOW_HOURS}h"
 log "fitness_mode=$EVOLUTION_FITNESS_MODE holdout_metric=$EVOLUTION_HOLDOUT_METRIC mipro_auto=$EVOLUTION_MIPRO_AUTO"
 log "nightly log: $NIGHTLY_LOG"
 
@@ -170,13 +173,13 @@ else
         EVOLVE_LOG="${LOG_DIR}/evolve-${SAFE_NAME}-${STAMP}.log"
         log "Phase 2: evolve skill=$CURRENT_SKILL mode=$MODE → $EVOLVE_LOG"
         set +e
-        python3 - "$CURRENT_SKILL" "$ITERATIONS" "$MODEL" "$TASK_MODEL" "$MODE" "$OPTIMIZER" "$OPTIMIZER_TIMEOUT" "$RUN_TIMEOUT" >>"$EVOLVE_LOG" 2>&1 <<'PY'
+        python3 - "$CURRENT_SKILL" "$ITERATIONS" "$MODEL" "$TASK_MODEL" "$EVAL_MODEL" "$MODE" "$OPTIMIZER" "$OPTIMIZER_TIMEOUT" "$RUN_TIMEOUT" >>"$EVOLVE_LOG" 2>&1 <<'PY'
 import os
 import signal
 import subprocess
 import sys
 
-skill, iterations, model, task_model, mode, optimizer, optimizer_timeout, run_timeout = sys.argv[1:]
+skill, iterations, model, task_model, eval_model, mode, optimizer, optimizer_timeout, run_timeout = sys.argv[1:]
 run_timeout_s = int(run_timeout)
 cmd = [
     sys.executable,
@@ -185,7 +188,7 @@ cmd = [
     "--skill", skill,
     "--iterations", iterations,
     "--optimizer-model", model,
-    "--eval-model", model,
+    "--eval-model", eval_model,
     "--task-model", task_model,
     "--mode", mode,
     "--optimizer", optimizer,

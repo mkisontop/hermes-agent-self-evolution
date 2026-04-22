@@ -121,9 +121,15 @@ def _resolve_optimizer_name(requested: str, inner_metric_mode: str) -> str:
     gateway (2026-04-21), so we pivot ``auto`` to MIPROv2 until GEPA is
     validated. Override with ``EVOLUTION_AUTO_OPTIMIZER=gepa`` (or ``miprov2``)
     to force a specific resolution for a single run.
+
+    ``mipro`` is accepted as an alias for ``miprov2`` at any layer so the
+    ``.env`` convention (OPTIMIZER=mipro) flows through nightly.sh cleanly.
     """
     requested = requested.strip().lower()
     inner_metric_mode = inner_metric_mode.strip().lower()
+    # Alias: mipro → miprov2 (matches what nightly.sh / .env use)
+    if requested == "mipro":
+        return "miprov2"
     if requested != "auto":
         return requested
     override = os.getenv("EVOLUTION_AUTO_OPTIMIZER", "").strip().lower()
@@ -831,8 +837,8 @@ def evolve(
 @click.option("--dry-run", is_flag=True, help="Validate setup without running optimization")
 @click.option("--mode", type=click.Choice(["propose", "auto"]), default="propose",
               help="propose: write to review queue (Task 3); auto: overwrite live skill if gate passes")
-@click.option("--optimizer", type=click.Choice(["auto", "gepa", "miprov2"]), default="auto",
-              help="Optimizer to use: auto routes to the stable default for the current metric mode")
+@click.option("--optimizer", type=click.Choice(["auto", "gepa", "miprov2", "mipro"]), default="auto",
+              help="Optimizer to use: auto routes to the stable default for the current metric mode. 'mipro' is an alias for 'miprov2'.")
 @click.option("--optimizer-timeout", default=None, type=int,
               help="Wall-clock timeout in seconds for optimizer.compile (default: EVOLUTION_OPTIMIZER_TIMEOUT or 900)")
 @click.option("--min-improvement", default=0.02, type=float, help="Minimum holdout Δ for auto-merge")
