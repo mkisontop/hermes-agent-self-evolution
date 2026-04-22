@@ -277,10 +277,121 @@ def live_ping(warnings: list) -> None:
             warnings.append(f"live {role} roundtrip failed")
 
 
+def judge_canary(skill_name: str) -> int:
+    """Single-example judge canary — isolates judge-phase health.
+
+    Runs exactly one real judge call on one holdout example using the
+    actual judge prompt shape (skill + task_input + expected_behavior +
+    fabricated agent_output), with EVOLUTION_JUDGE_* env overrides. Reports
+    prompt size, elapsed wall-clock, and pass/fail. No proposals are written.
+
+    This is the A-prime gate before re-running full MIPRO propose-1 under
+    a judge holdout. If this hangs/times out, do not rerun MIPRO — fix the
+    judge layer first (gateway, prompt shape, or fallback model).
+    """
+    import time
+    from pathlib import Path
+
+    section("judge-canary")
+
+    try:
+        from evolution.skills.skill_module import load_skill, find_skill
+        from evolution.core.config import get_hermes_agent_path
+        from evolution.core.fitness import LLMJudge
+        from evolution.core.lm_factory import make_lm
+    except Exception as e:
+        _fail(f"import failure: {type(e).__name__}: {e}")
+        return 1
+
+    hermes_agent_path = get_hermes_agent_path()
+    skill_path = find_skill(skill_name, hermes_agent_path)
+    if skill_path is None:
+        _fail(f"skill not found: {skill_name}")
+        return 1
+    skill = load_skill(skill_path)
+    skill_body = skill["body"]
+
+    task_input = (
+        "We need a plan to add email/password authentication to our FastAPI "
+        "app. Current repo has `src/api/`, `src/models/`, `src/services/`, "
+        "and `tests/`. Requirements: users can sign up, log in, and access a "
+        "protected `/me` endpoint. Use JWTs, bcrypt password hashing, and "
+        "SQLite for local dev. Please create an implementation plan."
+    )
+    expected_behavior = (
+        "Produces a full implementation plan document with header format, "
+        "goal, architecture, tech stack; bite-sized tasks; TDD cycles; "
+        "commit commands; exact file paths."
+    )
+    agent_output = (
+        "## Goal\nAdd email/password auth.\n\n## Task 1 — Model\n"
+        "Create `src/models/user.py` with email, hashed_password, created_at.\n"
+        "Run pytest tests/test_user.py -q. Commit.\n\n## Task 2 — Hashing\n"
+        "Add bcrypt utility. Test round-trip. Commit."
+    )
+
+    judge_model = os.getenv("EVOLUTION_JUDGE_MODEL", "openai/cx/gpt-5.4")
+    judge_timeout = int(os.getenv("EVOLUTION_JUDGE_TIMEOUT", "360"))
+    judge_retries = int(os.getenv("EVOLUTION_JUDGE_RETRIES", "0"))
+    judge_max_tokens = int(os.getenv("EVOLUTION_JUDGE_MAX_TOKENS", "1024"))
+
+    prompt_chars = (
+        len(skill_body) + len(task_input)
+        + len(expected_behavior) + len(agent_output)
+    )
+    print(f"  skill:          {skill_name}")
+    print(f"  model:          {judge_model}")
+    print(f"  timeout:        {judge_timeout}")
+    print(f"  retries:        {judge_retries}")
+    print(f"  max_tokens:     {judge_max_tokens}")
+    print(f"  prompt_chars:   {prompt_chars}  (skill={len(skill_body)} "
+          f"input={len(task_input)} expected={len(expected_behavior)} "
+          f"output={len(agent_output)})")
+
+    judge = LLMJudge(model=judge_model)
+
+    t0 = time.time()
+    try:
+        score = judge.score(
+            task_input=task_input,
+            expected_behavior=expected_behavior,
+            agent_output=agent_output,
+            skill_text=skill_body,
+        )
+        elapsed = time.time() - t0
+        print(f"  elapsed:        {elapsed:.1f}s")
+        # Detect the fitness.py fallback-neutral path (feedback starts with
+        # "[judge error, fallback neutral]"). That means the judge call
+        # raised — a real failure even though score() returned gracefully.
+        if str(score.feedback).startswith("[judge error"):
+            _fail(f"judge fallback triggered: {score.feedback[:160]}")
+            return 1
+        print(f"  correctness:    {score.correctness:.2f}")
+        print(f"  procedure:      {score.procedure_following:.2f}")
+        print(f"  conciseness:    {score.conciseness:.2f}")
+        print(_c("  result:         PASS", "green"))
+        return 0
+    except Exception as e:
+        elapsed = time.time() - t0
+        print(f"  elapsed:        {elapsed:.1f}s (failed)")
+        _fail(f"judge canary failed: {type(e).__name__}: {str(e)[:200]}")
+        return 2
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--live", action="store_true", help="Ping task + judge models")
+    ap.add_argument(
+        "--judge-canary",
+        metavar="SKILL",
+        default=None,
+        help="Run a single-example judge canary on SKILL (no proposal writes)",
+    )
     args = ap.parse_args()
+
+    if args.judge_canary:
+        print(_c("Hermes Self-Evolution Doctor — Judge Canary", "cyan"))
+        return judge_canary(args.judge_canary)
 
     print(_c("Hermes Self-Evolution Doctor", "cyan"))
     print(_c(f"  root: {ROOT}", "dim"))

@@ -32,6 +32,11 @@ from evolution.core.constraints import ConstraintValidator
 from evolution.core.regression_guard import AutoMergeGate
 from evolution.core.proposals import ProposalWriter, build_proposal_record
 from evolution.core.write_back import write_back_skill
+from evolution.core.lm_factory import (
+    make_lm,
+    judge_num_threads,
+    judge_phase_timeout,
+)
 from evolution.skills.skill_module import (
     SkillModule,
     load_skill,
@@ -129,8 +134,13 @@ def _build_optimizer_attempt_order(selected: str) -> list[str]:
     return [selected]
 
 
-def _compile_with_timeout(timeout_seconds: int, label: str, compile_fn: Callable[[], object]):
-    """Run an optimizer compile step with a hard wall-clock timeout.
+def _run_phase_with_timeout(timeout_seconds: int, label: str, phase_fn: Callable[[], object]):
+    """Run a phase (optimizer compile, holdout eval, etc.) with a hard wall-clock timeout.
+
+    Generalized from ``_compile_with_timeout`` (A-prime, 2026-04-22) so the
+    post-optimizer judge phase can get the same SIGALRM + faulthandler
+    treatment. A wedge in the holdout judge path is functionally identical
+    to a wedge in the optimizer loop — same hang class, same fix.
 
     On top of SIGALRM, arms faulthandler.dump_traceback_later() a few seconds
     before the alarm so that if the process is wedged inside a C-level
@@ -138,10 +148,10 @@ def _compile_with_timeout(timeout_seconds: int, label: str, compile_fn: Callable
     *before* the kill — turning the next hang into evidence instead of folklore.
     """
     if timeout_seconds <= 0 or not hasattr(signal, "setitimer"):
-        return compile_fn()
+        return phase_fn()
 
     def _handle_timeout(signum, frame):
-        raise OptimizerTimeoutError(f"{label} compile exceeded {timeout_seconds}s")
+        raise OptimizerTimeoutError(f"{label} exceeded {timeout_seconds}s")
 
     traceback_margin = max(1, _get_env_int("OPTIMIZER_TRACEBACK_MARGIN", 15))
     dump_after = max(1, timeout_seconds - traceback_margin)
@@ -166,7 +176,7 @@ def _compile_with_timeout(timeout_seconds: int, label: str, compile_fn: Callable
         pass
 
     try:
-        return compile_fn()
+        return phase_fn()
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous_handler)
@@ -174,6 +184,10 @@ def _compile_with_timeout(timeout_seconds: int, label: str, compile_fn: Callable
             faulthandler.cancel_dump_traceback_later()
         except Exception:
             pass
+
+
+# Back-compat alias: optimizer path still calls _compile_with_timeout.
+_compile_with_timeout = _run_phase_with_timeout
 
 
 def _run_gepa(
@@ -188,11 +202,7 @@ def _run_gepa(
     """Run GEPA with reflection enabled and a compile timeout."""
     from evolution.core.fitness import skill_fitness_metric_gepa
 
-    reflection_lm = dspy.LM(
-        optimizer_model,
-        timeout=_lm_request_timeout(),
-        num_retries=_lm_num_retries(),
-    )
+    reflection_lm = make_lm(optimizer_model, role="optimizer")
     max_metric_calls = _gepa_max_metric_calls(iterations, len(valset))
     log_dir = _gepa_log_dir(skill_name)
     console.print(f"  GEPA log_dir: {log_dir}")
@@ -237,16 +247,8 @@ def _run_miprov2(
     auto_level = os.getenv("EVOLUTION_MIPRO_AUTO", "manual").strip().lower() or "manual"
     auto_setting = None if auto_level in {"none", "off", "manual"} else auto_level
     num_candidates = None if auto_setting is not None else max(3, min(6, iterations + 2))
-    prompt_lm = dspy.LM(
-        optimizer_model,
-        timeout=_lm_request_timeout(),
-        num_retries=_lm_num_retries(),
-    )
-    task_lm = dspy.LM(
-        task_model,
-        timeout=_lm_request_timeout(),
-        num_retries=_lm_num_retries(),
-    )
+    prompt_lm = make_lm(optimizer_model, role="optimizer")
+    task_lm = make_lm(task_model, role="task")
     optimizer = dspy.MIPROv2(
         metric=skill_fitness_metric,
         prompt_model=prompt_lm,
@@ -415,13 +417,10 @@ def evolve(
     console.print(f"  Inner-loop metric: {inner_metric_mode}")
     console.print(f"  Optimizer timeout: {timeout_seconds}s")
 
-    # Configure DSPy. `timeout` is forwarded to litellm so a single hung
-    # request can't wedge the whole evaluation (per 2026-04-18 hang).
-    lm = dspy.LM(
-        eval_model,
-        timeout=_lm_request_timeout(),
-        num_retries=_lm_num_retries(),
-    )
+    # Default session LM = task role (used during baseline.forward() and
+    # evolved.forward() to generate agent outputs). The judge LM is built
+    # separately below with judge-role config (longer timeout, max_tokens cap).
+    lm = make_lm(task_model or eval_model, role="task")
     dspy.configure(lm=lm)
 
     # Create the baseline skill module
@@ -524,27 +523,65 @@ def evolve(
     holdout_metric = get_skill_fitness_metric(mode=holdout_metric_mode)
     console.print(f"  Holdout metric: {holdout_metric_mode}")
 
+    # Judge LM: separate role with longer timeout / zero retries / token cap.
+    # The judge is the authority layer — it must not share the task LM's
+    # short-timeout/high-concurrency config. (A-prime, 2026-04-22)
+    judge_threads = judge_num_threads() if holdout_metric_mode == "judge" else 4
+    console.print(f"  Holdout concurrency: num_threads={judge_threads}")
+
     from dspy.evaluate import Evaluate
     evaluator = Evaluate(
         devset=holdout_examples,
         metric=holdout_metric,
-        num_threads=4,
+        num_threads=judge_threads,
         display_progress=True,
         max_errors=max(1, len(holdout_examples) // 2),
         failure_score=0.0,
     )
-    with dspy.context(lm=lm):
-        baseline_result = evaluator(baseline_module)
-        evolved_result = evaluator(optimized_module)
 
-    # EvaluationResult.score is already a % (0-100) in current DSPy;
-    # normalize to 0-1 to match prior semantics and downstream gate inputs.
-    def _norm(r):
-        s = getattr(r, "score", r)
-        return s / 100.0 if s > 1.0 else s
+    # Judge failures must NOT discard optimizer success. If the holdout
+    # phase wedges or errors, we still want to emit a proposal artifact
+    # with judge_failed=true, auto_merge=false so the evolved skill can be
+    # reviewed manually. Concretely: wrap the holdout eval in a phase
+    # timeout + broad except, and surface the failure through metadata.
+    judge_failed = False
+    judge_error_type: Optional[str] = None
+    judge_error_message: Optional[str] = None
+    avg_baseline = 0.0
+    avg_evolved = 0.0
+    phase_cap = judge_phase_timeout() if holdout_metric_mode == "judge" else 0
 
-    avg_baseline = _norm(baseline_result)
-    avg_evolved = _norm(evolved_result)
+    def _run_holdout() -> tuple[float, float]:
+        with dspy.context(lm=lm):
+            b = evaluator(baseline_module)
+            e = evaluator(optimized_module)
+
+        def _norm(r):
+            s = getattr(r, "score", r)
+            return s / 100.0 if s > 1.0 else s
+
+        return _norm(b), _norm(e)
+
+    try:
+        if phase_cap > 0:
+            avg_baseline, avg_evolved = _run_phase_with_timeout(
+                phase_cap, "holdout judge evaluation", _run_holdout
+            )
+        else:
+            avg_baseline, avg_evolved = _run_holdout()
+    except Exception as je:
+        judge_failed = True
+        judge_error_type = type(je).__name__
+        judge_error_message = str(je)[:300]
+        console.print(
+            f"[red]✗ Holdout evaluation failed: {judge_error_type}: {judge_error_message}[/red]"
+        )
+        console.print(
+            "[yellow]  Preserving evolved artifact for manual review (auto_merge=false).[/yellow]"
+        )
+        avg_baseline = 0.0
+        avg_evolved = 0.0
+
     improvement = avg_evolved - avg_baseline
 
     # ── 9. Report results ───────────────────────────────────────────────
@@ -615,10 +652,26 @@ def evolve(
         regression_tolerance=regression_tolerance,
     )
     decision = gate.evaluate(avg_baseline, avg_evolved, evolved_pass)
+
+    # Judge failure override: if holdout eval couldn't produce real scores,
+    # the gate cannot approve auto-merge regardless of what 0.0 vs 0.0 says.
+    # Force auto_merge=false with an explicit reason.
+    if judge_failed:
+        try:
+            decision.auto_merge = False
+            decision.reason = (
+                f"judge_failed: {judge_error_type} — manual review required"
+            )
+        except Exception:
+            pass  # decision dataclass may be frozen in some builds
+
     metrics["auto_merge"] = decision.auto_merge
     metrics["gate_reason"] = decision.reason
     metrics["regression"] = decision.regression
     metrics["mode"] = mode
+    metrics["judge_failed"] = judge_failed
+    metrics["judge_error_type"] = judge_error_type
+    metrics["judge_error_message"] = judge_error_message
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
 
     console.print(f"\n[bold]Gate decision:[/bold] {decision.reason}")
@@ -651,6 +704,9 @@ def evolve(
                 "holdout_examples": len(dataset.holdout),
                 "eval_source": eval_source,
                 "output_dir": str(output_dir),
+                "judge_failed": judge_failed,
+                "judge_error_type": judge_error_type,
+                "judge_error_message": judge_error_message,
             },
             timestamp=timestamp,
         )

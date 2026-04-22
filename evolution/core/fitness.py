@@ -99,7 +99,13 @@ class LLMJudge:
     ) -> FitnessScore:
         """Score an agent output using LLM-as-judge."""
 
-        lm = dspy.LM(self.model, timeout=60, num_retries=2)
+        # A-prime (2026-04-22): route through role-aware factory so judge
+        # timeout/retries/max_tokens follow EVOLUTION_JUDGE_* env overrides.
+        # Previously hardcoded timeout=60, num_retries=2 — which multiplied
+        # a single gateway slowdown into 180s+ per call and wedged the
+        # holdout phase at num_threads=4 concurrency.
+        from evolution.core.lm_factory import make_lm
+        lm = make_lm(self.model, role="judge")
 
         try:
             with dspy.context(lm=lm):
