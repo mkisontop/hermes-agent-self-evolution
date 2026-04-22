@@ -15,7 +15,13 @@ authors = [
 keywords = ["llm", "optimization", "evolution", "dspy", "gepa", "hermes", "agent"]
 
 dependencies = [
-    "dspy>=3.0.0",
+    # Locked set — produced by `pip-compile --generate-hashes` and installed
+    # via `pip install --require-hashes -r requirements.lock`. Upgrade only
+    # through a canary venv (see README §Dependencies).
+    # dspy 3.2.0 constrains litellm to 1.82.x; 1.82.6 is pre-compromise (safe).
+    # Compromised litellm releases were 1.82.7 and 1.82.8 only.
+    "dspy==3.2.0",
+    "litellm==1.82.6",
     "openai>=1.0.0",
     "pyyaml>=6.0",
     "click>=8.0",

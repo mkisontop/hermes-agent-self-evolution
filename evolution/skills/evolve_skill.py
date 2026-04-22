@@ -5,12 +5,15 @@ Usage:
     python -m evolution.skills.evolve_skill --skill arxiv --eval-source golden --dataset datasets/skills/arxiv/
 """
 
+import faulthandler
 import json
+import os
+import signal
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
-from datetime import datetime
-from typing import Optional
+from typing import Callable, Optional
 
 import click
 import dspy
@@ -21,7 +24,10 @@ from rich.table import Table
 from evolution.core.config import EvolutionConfig, get_hermes_agent_path
 from evolution.core.dataset_builder import SyntheticDatasetBuilder, EvalDataset, GoldenDatasetLoader
 from evolution.core.external_importers import build_dataset_from_external
-from evolution.core.fitness import skill_fitness_metric, LLMJudge, FitnessScore
+from evolution.core.fitness import (
+    skill_fitness_metric,
+    get_skill_fitness_metric,
+)
 from evolution.core.constraints import ConstraintValidator
 from evolution.core.regression_guard import AutoMergeGate
 from evolution.core.proposals import ProposalWriter, build_proposal_record
@@ -36,17 +42,251 @@ from evolution.skills.skill_module import (
 console = Console()
 
 
+class OptimizerTimeoutError(TimeoutError):
+    """Raised when an optimizer compile step exceeds its time budget."""
+
+
+def _get_env_int(name: str, default: int) -> int:
+    """Read an integer env var with a safe fallback."""
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _lm_num_retries() -> int:
+    """LM retry count. Default 0 so a single hang doesn't triple the wall-clock.
+
+    Raise in production via env override (e.g. ``EVOLUTION_LM_NUM_RETRIES=1``).
+    """
+    return max(0, _get_env_int("EVOLUTION_LM_NUM_RETRIES", 0))
+
+
+def _lm_request_timeout() -> int:
+    """Per-LM-request timeout (seconds). Forwarded to LiteLLM."""
+    return max(1, _get_env_int("EVOLUTION_LM_TIMEOUT", 120))
+
+
+def _gepa_log_dir(skill_name: str) -> str:
+    """Per-run GEPA log directory. Always a fresh path to avoid silent resume.
+
+    Relative to the current working directory (self-evolution root) to keep
+    logs scoped with the rest of the engine's on-disk artifacts.
+    """
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    safe_name = skill_name.replace("/", "-")
+    path = Path("logs") / "gepa" / safe_name / stamp
+    path.mkdir(parents=True, exist_ok=False)
+    return str(path)
+
+
+def _gepa_max_metric_calls(iterations: int, valset_len: int) -> Optional[int]:
+    """Cap on total metric calls for a GEPA run.
+
+    Env override ``EVOLUTION_GEPA_MAX_METRIC_CALLS`` wins. Otherwise derive a
+    generous default from iterations × valset, with a floor that prevents
+    accidental micro-budgets but still trips runaway fan-out.
+    Return None to leave GEPA's own default in place if explicitly set to 0.
+    """
+    raw = os.getenv("EVOLUTION_GEPA_MAX_METRIC_CALLS")
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError:
+            value = 0
+        if value > 0:
+            return value
+        return None
+    return max(20, iterations * max(1, valset_len) * 3)
+
+
+def _resolve_optimizer_name(requested: str, inner_metric_mode: str) -> str:
+    """Resolve auto-routing to a concrete optimizer.
+
+    Historically ``auto`` + ``judge`` → GEPA. GEPA currently hangs on the local
+    gateway (2026-04-21), so we pivot ``auto`` to MIPROv2 until GEPA is
+    validated. Override with ``EVOLUTION_AUTO_OPTIMIZER=gepa`` (or ``miprov2``)
+    to force a specific resolution for a single run.
+    """
+    requested = requested.strip().lower()
+    inner_metric_mode = inner_metric_mode.strip().lower()
+    if requested != "auto":
+        return requested
+    override = os.getenv("EVOLUTION_AUTO_OPTIMIZER", "").strip().lower()
+    if override in {"gepa", "miprov2", "mipro"}:
+        return "miprov2" if override == "mipro" else override
+    # Default auto → MIPROv2 while GEPA is under investigation.
+    return "miprov2"
+
+
+def _build_optimizer_attempt_order(selected: str) -> list[str]:
+    """Build the ordered list of optimizer attempts for a run."""
+    if selected == "gepa":
+        return ["gepa", "miprov2"]
+    return [selected]
+
+
+def _compile_with_timeout(timeout_seconds: int, label: str, compile_fn: Callable[[], object]):
+    """Run an optimizer compile step with a hard wall-clock timeout.
+
+    On top of SIGALRM, arms faulthandler.dump_traceback_later() a few seconds
+    before the alarm so that if the process is wedged inside a C-level
+    socket/poll (the 2026-04-21 ``sock_recv`` case), we get a thread dump
+    *before* the kill — turning the next hang into evidence instead of folklore.
+    """
+    if timeout_seconds <= 0 or not hasattr(signal, "setitimer"):
+        return compile_fn()
+
+    def _handle_timeout(signum, frame):
+        raise OptimizerTimeoutError(f"{label} compile exceeded {timeout_seconds}s")
+
+    traceback_margin = max(1, _get_env_int("OPTIMIZER_TRACEBACK_MARGIN", 15))
+    dump_after = max(1, timeout_seconds - traceback_margin)
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    signal.signal(signal.SIGALRM, _handle_timeout)
+    signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+
+    faulthandler_was_enabled = faulthandler.is_enabled()
+    if not faulthandler_was_enabled:
+        try:
+            faulthandler.enable(file=sys.stderr)
+        except Exception:
+            pass  # defensive — never let faulthandler setup block the run
+    try:
+        faulthandler.dump_traceback_later(
+            dump_after,
+            repeat=False,
+            file=sys.stderr,
+        )
+    except Exception:
+        pass
+
+    try:
+        return compile_fn()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        try:
+            faulthandler.cancel_dump_traceback_later()
+        except Exception:
+            pass
+
+
+def _run_gepa(
+    baseline_module: SkillModule,
+    trainset: list,
+    valset: list,
+    iterations: int,
+    optimizer_model: str,
+    timeout_seconds: int,
+    skill_name: str,
+):
+    """Run GEPA with reflection enabled and a compile timeout."""
+    from evolution.core.fitness import skill_fitness_metric_gepa
+
+    reflection_lm = dspy.LM(
+        optimizer_model,
+        timeout=_lm_request_timeout(),
+        num_retries=_lm_num_retries(),
+    )
+    max_metric_calls = _gepa_max_metric_calls(iterations, len(valset))
+    log_dir = _gepa_log_dir(skill_name)
+    console.print(f"  GEPA log_dir: {log_dir}")
+    # DSPy GEPA docs require exactly one budget param (auto | max_full_evals |
+    # max_metric_calls). Passing both is undefined behavior. We prefer
+    # max_metric_calls for debugging: it's a hard cap on LM calls, easier to
+    # reason about than full evals × valset size.
+    if max_metric_calls is None:
+        max_metric_calls = max(4, iterations * max(1, len(valset)) * 3)
+    console.print(f"  GEPA max_metric_calls: {max_metric_calls}")
+    gepa_kwargs = dict(
+        metric=skill_fitness_metric_gepa,
+        max_metric_calls=max_metric_calls,
+        reflection_lm=reflection_lm,
+        num_threads=1,
+        log_dir=log_dir,
+        track_stats=True,
+    )
+    optimizer = dspy.GEPA(**gepa_kwargs)
+    return _compile_with_timeout(
+        timeout_seconds,
+        "GEPA",
+        lambda: optimizer.compile(
+            baseline_module,
+            trainset=trainset,
+            valset=valset,
+        ),
+    )
+
+
+def _run_miprov2(
+    baseline_module: SkillModule,
+    trainset: list,
+    valset: list,
+    iterations: int,
+    optimizer_model: str,
+    task_model: str,
+    eval_model: str,
+    timeout_seconds: int,
+):
+    """Run MIPROv2 with explicit proposer and task models."""
+    auto_level = os.getenv("EVOLUTION_MIPRO_AUTO", "manual").strip().lower() or "manual"
+    auto_setting = None if auto_level in {"none", "off", "manual"} else auto_level
+    num_candidates = None if auto_setting is not None else max(3, min(6, iterations + 2))
+    prompt_lm = dspy.LM(
+        optimizer_model,
+        timeout=_lm_request_timeout(),
+        num_retries=_lm_num_retries(),
+    )
+    task_lm = dspy.LM(
+        task_model,
+        timeout=_lm_request_timeout(),
+        num_retries=_lm_num_retries(),
+    )
+    optimizer = dspy.MIPROv2(
+        metric=skill_fitness_metric,
+        prompt_model=prompt_lm,
+        task_model=task_lm,
+        max_bootstrapped_demos=0,
+        max_labeled_demos=0,
+        auto=auto_setting,
+        num_candidates=num_candidates,
+        num_threads=1,
+        track_stats=True,
+    )
+    compile_kwargs = {
+        "trainset": trainset,
+        "valset": valset,
+        "minibatch": False,
+        "requires_permission_to_run": False,
+    }
+    if auto_setting is None:
+        compile_kwargs["num_trials"] = iterations
+    return _compile_with_timeout(
+        timeout_seconds,
+        "MIPROv2",
+        lambda: optimizer.compile(baseline_module, **compile_kwargs),
+    )
+
+
 def evolve(
     skill_name: str,
     iterations: int = 10,
     eval_source: str = "synthetic",
     dataset_path: Optional[str] = None,
-    optimizer_model: str = "openai/gpt-4.1",
-    eval_model: str = "openai/gpt-4.1-mini",
+    optimizer_model: str = os.getenv("EVOLUTION_OPTIMIZER_MODEL", "openai/cx/gpt-5.3-codex-spark"),
+    eval_model: str = os.getenv("EVOLUTION_EVAL_MODEL", "openai/cx/gpt-5.4"),
+    task_model: Optional[str] = None,
     hermes_repo: Optional[str] = None,
     run_tests: bool = False,
     dry_run: bool = False,
     mode: str = "propose",
+    optimizer: str = "auto",
+    optimizer_timeout: Optional[int] = None,
     min_improvement: float = 0.02,
     regression_tolerance: float = 0.01,
     proposals_dir: Optional[str] = None,
@@ -63,6 +303,25 @@ def evolve(
     if hermes_repo:
         config.hermes_agent_path = Path(hermes_repo)
 
+    # ── 0. Self-target invariant (Batch A — layer 2) ─────────────────────
+    # The engine must not rewrite itself. Picker has its own denylist, but
+    # defense-in-depth requires refusing the skill here too — even if the
+    # user explicitly passed --skill hermes-self-evolution. Override only
+    # via EVOLUTION_ALLOW_SELF_TARGET=1 and only for manual runs.
+    _SELF_EVOLUTION_SKILLS = {
+        "hermes-self-evolution",
+        "self-evolution",
+        "evolution-engine",
+    }
+    if skill_name in _SELF_EVOLUTION_SKILLS and os.getenv("EVOLUTION_ALLOW_SELF_TARGET") != "1":
+        console.print(
+            f"[red]✗ Refusing to evolve engine/self-evolution skill: {skill_name}[/red]"
+        )
+        console.print(
+            "[yellow]  Set EVOLUTION_ALLOW_SELF_TARGET=1 for a deliberate manual run.[/yellow]"
+        )
+        sys.exit(2)
+
     # ── 1. Find and load the skill ──────────────────────────────────────
     console.print(f"\n[bold cyan]🧬 Hermes Agent Self-Evolution[/bold cyan] — Evolving skill: [bold]{skill_name}[/bold]\n")
 
@@ -77,10 +336,18 @@ def evolve(
     console.print(f"  Size: {len(skill['raw']):,} chars")
     console.print(f"  Description: {skill['description'][:80]}...")
 
+    inner_metric_mode = os.getenv("EVOLUTION_FITNESS_MODE", "fast").strip().lower() or "fast"
+    selected_optimizer = _resolve_optimizer_name(optimizer, inner_metric_mode)
+    timeout_seconds = optimizer_timeout or _get_env_int("EVOLUTION_OPTIMIZER_TIMEOUT", 900)
+    task_model = task_model or os.getenv("EVOLUTION_TASK_MODEL") or eval_model
+
     if dry_run:
         console.print(f"\n[bold green]DRY RUN — setup validated successfully.[/bold green]")
         console.print(f"  Would generate eval dataset (source: {eval_source})")
-        console.print(f"  Would run GEPA optimization ({iterations} iterations)")
+        console.print(f"  Would run {selected_optimizer.upper()} optimization ({iterations} iterations)")
+        console.print(f"  Inner-loop metric: {inner_metric_mode}")
+        console.print(f"  Task model: {task_model}")
+        console.print(f"  Optimizer timeout: {timeout_seconds}s")
         console.print(f"  Would validate constraints and create PR")
         return
 
@@ -140,13 +407,21 @@ def evolve(
 
     # ── 4. Set up DSPy + GEPA optimizer ─────────────────────────────────
     console.print(f"\n[bold]Configuring optimizer[/bold]")
-    console.print(f"  Optimizer: GEPA ({iterations} iterations)")
+    console.print(f"  Requested optimizer: {optimizer}")
+    console.print(f"  Selected optimizer: {selected_optimizer} ({iterations} iterations)")
     console.print(f"  Optimizer model: {optimizer_model}")
     console.print(f"  Eval model: {eval_model}")
+    console.print(f"  Task model: {task_model}")
+    console.print(f"  Inner-loop metric: {inner_metric_mode}")
+    console.print(f"  Optimizer timeout: {timeout_seconds}s")
 
     # Configure DSPy. `timeout` is forwarded to litellm so a single hung
     # request can't wedge the whole evaluation (per 2026-04-18 hang).
-    lm = dspy.LM(eval_model, timeout=120, num_retries=2)
+    lm = dspy.LM(
+        eval_model,
+        timeout=_lm_request_timeout(),
+        num_retries=_lm_num_retries(),
+    )
     dspy.configure(lm=lm)
 
     # Create the baseline skill module
@@ -156,33 +431,53 @@ def evolve(
     trainset = dataset.to_dspy_examples("train")
     valset = dataset.to_dspy_examples("val")
 
-    # ── 5. Run GEPA optimization ────────────────────────────────────────
-    console.print(f"\n[bold cyan]Running GEPA optimization ({iterations} iterations)...[/bold cyan]\n")
+    # ── 5. Run optimizer ────────────────────────────────────────────────
+    console.print(
+        f"\n[bold cyan]Running {selected_optimizer.upper()} optimization ({iterations} iterations)...[/bold cyan]\n"
+    )
 
     start_time = time.time()
 
-    try:
-        optimizer = dspy.GEPA(
-            metric=skill_fitness_metric,
-            max_steps=iterations,
-        )
+    optimized_module = None
+    optimizer_attempts = _build_optimizer_attempt_order(selected_optimizer)
+    last_error = None
+    for attempt_name in optimizer_attempts:
+        try:
+            if attempt_name == "gepa":
+                optimized_module = _run_gepa(
+                    baseline_module=baseline_module,
+                    trainset=trainset,
+                    valset=valset,
+                    iterations=iterations,
+                    optimizer_model=optimizer_model,
+                    timeout_seconds=timeout_seconds,
+                    skill_name=skill_name,
+                )
+            elif attempt_name == "miprov2":
+                optimized_module = _run_miprov2(
+                    baseline_module=baseline_module,
+                    trainset=trainset,
+                    valset=valset,
+                    iterations=iterations,
+                    optimizer_model=optimizer_model,
+                    task_model=task_model,
+                    eval_model=eval_model,
+                    timeout_seconds=timeout_seconds,
+                )
+            else:
+                raise ValueError(f"Unknown optimizer: {attempt_name}")
+            selected_optimizer = attempt_name
+            break
+        except Exception as e:
+            last_error = e
+            console.print(
+                f"[yellow]{attempt_name.upper()} failed ({type(e).__name__}: {e})[/yellow]"
+            )
+            if attempt_name != optimizer_attempts[-1]:
+                console.print("[yellow]Falling back to MIPROv2[/yellow]")
 
-        optimized_module = optimizer.compile(
-            baseline_module,
-            trainset=trainset,
-            valset=valset,
-        )
-    except Exception as e:
-        # Fall back to MIPROv2 if GEPA isn't available in this DSPy version
-        console.print(f"[yellow]GEPA not available ({e}), falling back to MIPROv2[/yellow]")
-        optimizer = dspy.MIPROv2(
-            metric=skill_fitness_metric,
-            auto="light",
-        )
-        optimized_module = optimizer.compile(
-            baseline_module,
-            trainset=trainset,
-        )
+    if optimized_module is None:
+        raise last_error or RuntimeError("Optimizer failed without an exception")
 
     elapsed = time.time() - start_time
     console.print(f"\n  Optimization completed in {elapsed:.1f}s")
@@ -221,13 +516,18 @@ def evolve(
 
     holdout_examples = dataset.to_dspy_examples("holdout")
 
-    # Use dspy.Evaluate for parallel, progress-visible, error-tolerant holdout
-    # scoring. Prior serial loop silently hung on any single slow LLM call
-    # and gave no progress output — see 2026-04-18 smoke hang.
+    # Holdout uses the LLM-judge metric for honest before/after scoring.
+    # Inner loop (GEPA/MIPROv2 above) uses the cheap keyword metric — or
+    # whatever EVOLUTION_FITNESS_MODE overrides it to — to stay in budget.
+    # Holdout is small (5-10 examples) so the judge cost is bounded.
+    holdout_metric_mode = os.getenv("EVOLUTION_HOLDOUT_METRIC", "judge")
+    holdout_metric = get_skill_fitness_metric(mode=holdout_metric_mode)
+    console.print(f"  Holdout metric: {holdout_metric_mode}")
+
     from dspy.evaluate import Evaluate
     evaluator = Evaluate(
         devset=holdout_examples,
-        metric=skill_fitness_metric,
+        metric=holdout_metric,
         num_threads=4,
         display_progress=True,
         max_errors=max(1, len(holdout_examples) // 2),
@@ -291,6 +591,11 @@ def evolve(
         "iterations": iterations,
         "optimizer_model": optimizer_model,
         "eval_model": eval_model,
+        "task_model": task_model,
+        "requested_optimizer": optimizer,
+        "selected_optimizer": selected_optimizer,
+        "inner_metric_mode": inner_metric_mode,
+        "optimizer_timeout_seconds": timeout_seconds,
         "baseline_score": avg_baseline,
         "evolved_score": avg_evolved,
         "improvement": improvement,
@@ -402,18 +707,24 @@ def evolve(
 @click.option("--eval-source", default="synthetic", type=click.Choice(["synthetic", "golden", "sessiondb"]),
               help="Source for evaluation dataset")
 @click.option("--dataset-path", default=None, help="Path to existing eval dataset (JSONL)")
-@click.option("--optimizer-model", default="openai/gpt-4.1", help="Model for GEPA reflections")
-@click.option("--eval-model", default="openai/gpt-4.1-mini", help="Model for evaluations")
+@click.option("--optimizer-model", default=lambda: os.getenv("EVOLUTION_OPTIMIZER_MODEL", "openai/cx/gpt-5.3-codex-spark"), help="Model for GEPA reflections / MIPRO prompt_model (default: $EVOLUTION_OPTIMIZER_MODEL or codex-spark)")
+@click.option("--eval-model", default=lambda: os.getenv("EVOLUTION_EVAL_MODEL", "openai/cx/gpt-5.4"), help="Model for evaluations / judge (default: $EVOLUTION_EVAL_MODEL or gpt-5.4)")
+@click.option("--task-model", default=None, help="Model for inner-loop rollout generation; defaults to EVOLUTION_TASK_MODEL or eval-model")
 @click.option("--hermes-repo", default=None, help="Path to hermes-agent repo")
 @click.option("--run-tests", is_flag=True, help="Run full pytest suite as constraint gate")
 @click.option("--dry-run", is_flag=True, help="Validate setup without running optimization")
 @click.option("--mode", type=click.Choice(["propose", "auto"]), default="propose",
               help="propose: write to review queue (Task 3); auto: overwrite live skill if gate passes")
+@click.option("--optimizer", type=click.Choice(["auto", "gepa", "miprov2"]), default="auto",
+              help="Optimizer to use: auto routes to the stable default for the current metric mode")
+@click.option("--optimizer-timeout", default=None, type=int,
+              help="Wall-clock timeout in seconds for optimizer.compile (default: EVOLUTION_OPTIMIZER_TIMEOUT or 900)")
 @click.option("--min-improvement", default=0.02, type=float, help="Minimum holdout Δ for auto-merge")
 @click.option("--regression-tolerance", default=0.01, type=float, help="Negative Δ tolerance before flagging regression")
 @click.option("--proposals-dir", default=None, help="Where propose-only writes land (Task 3)")
-def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model,
-         hermes_repo, run_tests, dry_run, mode, min_improvement, regression_tolerance, proposals_dir):
+def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, task_model,
+         hermes_repo, run_tests, dry_run, mode, optimizer, optimizer_timeout,
+         min_improvement, regression_tolerance, proposals_dir):
     """Evolve a Hermes Agent skill using DSPy + GEPA optimization."""
     evolve(
         skill_name=skill,
@@ -422,10 +733,13 @@ def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_mod
         dataset_path=dataset_path,
         optimizer_model=optimizer_model,
         eval_model=eval_model,
+        task_model=task_model,
         hermes_repo=hermes_repo,
         run_tests=run_tests,
         dry_run=dry_run,
         mode=mode,
+        optimizer=optimizer,
+        optimizer_timeout=optimizer_timeout,
         min_improvement=min_improvement,
         regression_tolerance=regression_tolerance,
         proposals_dir=proposals_dir,

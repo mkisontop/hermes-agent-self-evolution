@@ -85,14 +85,17 @@ python -m evolution.skills.evolve_skill \
 
 | Var | Default | Purpose |
 |-----|---------|---------|
-| `SKILL` | `github-code-review` | Target skill slug |
-| `ITERATIONS` | `10` | GEPA generations |
+| `SKILL` | _top-3 from usage picker_ | Target skill slug (overrides picker) |
+| `ITERATIONS` | `10` | GEPA generations / MIPRO trials budget |
 | `MODE` | `propose` | `propose` \| `auto` |
-| `OPTIMIZER_MODEL` | `openai/cx/gpt-5.4` | Optimizer LLM |
-| `EVAL_MODEL` | `openai/cx/gpt-5.4` | Eval LLM |
+| `EVOLUTION_OPTIMIZER_MODEL` | `openai/cx/gpt-5.3-codex-spark` | Optimizer / proposer / reflection LLM |
+| `EVOLUTION_EVAL_MODEL` | `openai/cx/gpt-5.4` | Judge / before-after eval LLM |
+| `EVOLUTION_TASK_MODEL` | `openai/cx/gpt-5.3-codex-spark` | Task rollout LLM |
+| `EVOLUTION_AUTO_OPTIMIZER` | _(unset)_ | Force `gepa` or `miprov2` when `--optimizer auto` |
+| `EVOLUTION_LM_NUM_RETRIES` | `0` | LM retry count (0 to surface hangs immediately) |
 | `DIGEST_WINDOW_HOURS` | `24` | Digest lookback window |
 | `SKIP_SMOKE` | `` | Set `1` to skip phase 1 |
-| `SKIP_EVOLVE` | `` | Set `1` to skip phase 2 (digest-only runs) |
+| `SKIP_EVOLVE` | _auto under cron_ | `1` = digest-only; `ALLOW_EVOLVE=1` to force evolve under cron |
 | `SKIP_DIGEST` | `` | Set `1` to skip phase 3 |
 
 **Schedule:**

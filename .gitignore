@@ -23,6 +23,7 @@ snapshots/
 logs/
 output/
 proposals/
+backups/
 
 # IDE
 .idea/

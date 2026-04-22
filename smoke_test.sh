@@ -23,9 +23,14 @@ set -uo pipefail
 cd "$(dirname "$0")"
 
 # ── env ──────────────────────────────────────────────────────────────
-export OPENAI_API_BASE="http://localhost:20128/v1"
-export OPENAI_BASE_URL="http://localhost:20128/v1"
-export OPENAI_API_KEY="${OPENAI_API_KEY:-dummy-local-key}"
+_SELF_EVO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$_SELF_EVO_ROOT/.env" ]]; then
+    # shellcheck disable=SC1091
+    set -a; source "$_SELF_EVO_ROOT/.env"; set +a
+fi
+export OPENAI_API_BASE="${OPENAI_API_BASE:-http://localhost:20128/v1}"
+export OPENAI_BASE_URL="${OPENAI_BASE_URL:-http://localhost:20128/v1}"
+export OPENAI_API_KEY="${OPENAI_API_KEY:?OPENAI_API_KEY not set (put it in $_SELF_EVO_ROOT/.env)}"
 
 MODEL="openai/cx/gpt-5.4"
 RAW_MODEL="cx/gpt-5.4"
