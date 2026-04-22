@@ -36,12 +36,18 @@ from pathlib import Path
 from typing import List, Optional
 
 from evolution.core.config import EvolutionConfig, get_hermes_agent_path
+from evolution.core.manifest import (
+    load_manifest,
+    verify_evolved_artifact,
+    verify_live_baseline,
+)
 from evolution.core.proposals import (
     PROPOSAL_STATUS_APPROVED,
     PROPOSAL_STATUS_PENDING,
     PROPOSAL_STATUS_REJECTED,
 )
-from evolution.core.write_back import write_back_skill
+from evolution.core.risk import RiskTier, is_auto_merge_eligible
+from evolution.core.write_back import WriteBackRejected, write_back_skill
 from evolution.skills.skill_module import find_skill
 
 
@@ -254,6 +260,49 @@ def cmd_approve(args: argparse.Namespace) -> int:
         return 2
     evolved_text = evolved_file.read_text()
 
+    # Batch B: manifest verification before any write-back.
+    #   1. evolved artifact hash must match manifest (tampering check)
+    #   2. live baseline hash must match manifest (stale-baseline check)
+    #   3. risk tier must permit auto-merge (CRITICAL is manual-only)
+    # Each check can be overridden independently:
+    #   --force-stale      — allow live baseline drift
+    #   --force-tampered   — allow evolved-artifact hash mismatch (dangerous)
+    #   --force-critical   — allow CRITICAL-tier write-back (extremely dangerous)
+    manifest = load_manifest(entry.proposal_dir)
+    if manifest is None:
+        if not args.allow_no_manifest:
+            print(
+                "  ⛔ manifest.json missing — refuse to approve without "
+                "integrity hashes. Pass --allow-no-manifest to override "
+                "for pre-Batch-B proposals.",
+                file=sys.stderr,
+            )
+            return 6
+        print(
+            "  ⚠️  manifest.json missing — proceeding with --allow-no-manifest",
+            file=sys.stderr,
+        )
+    else:
+        # Risk tier guard.
+        tier = RiskTier.parse(manifest.risk_tier) or RiskTier.MEDIUM
+        if not is_auto_merge_eligible(tier) and not args.force_critical:
+            print(
+                f"  ⛔ risk={tier.value} — auto-merge forbidden. "
+                f"Pass --force-critical to override (not recommended).",
+                file=sys.stderr,
+            )
+            return 7
+        # Tampering check.
+        ev_result = verify_evolved_artifact(manifest, entry.proposal_dir)
+        if not ev_result.ok and not args.force_tampered:
+            print(f"  ⛔ {ev_result.reason}", file=sys.stderr)
+            print(
+                "     Pass --force-tampered to override (proposal may be "
+                "compromised; prefer re-running the evolution).",
+                file=sys.stderr,
+            )
+            return 8
+
     # Flip STATUS first so state is authoritative even if the write-back is skipped.
     status_file = entry.proposal_dir / "STATUS"
     approved_by = args.approved_by or _default_approver()
@@ -282,13 +331,33 @@ def cmd_approve(args: argparse.Namespace) -> int:
         )
         return 4
 
-    result = write_back_skill(
-        live_path=live_path,
-        evolved_text=evolved_text,
-        mode="auto",
-        auto_merge=True,
-        timestamp=approval_ts,
-    )
+    # Stale-baseline guard (Batch B): verify the live file still hashes to the
+    # manifest's baseline. If it doesn't, the live skill has drifted since the
+    # proposal was written — a parallel run, a hand-edit, or a previous
+    # approval already landed. Refuse unless --force-stale.
+    if manifest is not None:
+        live_result = verify_live_baseline(manifest, live_path)
+        if not live_result.ok and not args.force_stale:
+            print(f"  ⛔ {live_result.reason}", file=sys.stderr)
+            print(
+                "     Live skill drifted since proposal was written. Pass "
+                "--force-stale to override, or re-run evolution on the current "
+                "baseline.",
+                file=sys.stderr,
+            )
+            return 9
+
+    try:
+        result = write_back_skill(
+            live_path=live_path,
+            evolved_text=evolved_text,
+            mode="auto",
+            auto_merge=True,
+            timestamp=approval_ts,
+        )
+    except WriteBackRejected as e:
+        print(f"  ⛔ write-back refused: {e}", file=sys.stderr)
+        return 10
     if result.merged:
         print(f"  📝 merged → {result.live_path}")
         print(f"  🛟 backup → {result.backup_path}")
@@ -400,6 +469,28 @@ def _build_parser() -> argparse.ArgumentParser:
     p_approve.add_argument(
         "--hermes-agent-path",
         help="Override hermes-agent root (defaults to ~/.hermes/hermes-agent)",
+    )
+    # Batch B: manifest-integrity override flags. Default-off; each one
+    # requires an explicit human decision with audit trail in the STATUS file.
+    p_approve.add_argument(
+        "--allow-no-manifest",
+        action="store_true",
+        help="Approve proposals that predate Batch B (no manifest.json)",
+    )
+    p_approve.add_argument(
+        "--force-stale",
+        action="store_true",
+        help="Allow write-back even if the live baseline has drifted",
+    )
+    p_approve.add_argument(
+        "--force-tampered",
+        action="store_true",
+        help="Allow write-back even if evolved_skill.md hash mismatches manifest (dangerous)",
+    )
+    p_approve.add_argument(
+        "--force-critical",
+        action="store_true",
+        help="Allow write-back of CRITICAL-tier skills (extremely dangerous)",
     )
     p_approve.set_defaults(func=cmd_approve)
 

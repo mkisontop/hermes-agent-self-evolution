@@ -5,6 +5,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -45,6 +46,8 @@ def _write_proposal(
     auto_merge: bool = False,
     reason: str = "improvement below threshold",
     mode: str = "propose",
+    risk_tier: str = "medium",
+    with_manifest: bool = True,
 ) -> Path:
     writer = ProposalWriter(proposals_dir)
     record = build_proposal_record(
@@ -61,7 +64,25 @@ def _write_proposal(
         mode=mode,
         timestamp=timestamp,
     )
-    return writer.write(record)
+    proposal_dir = writer.write(record)
+
+    # Batch B: proposals now carry a manifest.json with integrity hashes.
+    # Tests default to emitting a manifest so approve-path tests exercise
+    # the full verification pipeline; pass ``with_manifest=False`` to
+    # simulate pre-Batch-B proposals and test the --allow-no-manifest flow.
+    if with_manifest:
+        from evolution.core.manifest import build_manifest, write_manifest
+        diff_text = (proposal_dir / "diff.patch").read_text() if (proposal_dir / "diff.patch").exists() else ""
+        m = build_manifest(
+            skill_name=skill_name,
+            timestamp=timestamp,
+            risk_tier=risk_tier,
+            baseline_text=baseline,
+            evolved_text=evolved,
+            diff_text=diff_text,
+        )
+        write_manifest(proposal_dir, m)
+    return proposal_dir
 
 
 @pytest.fixture
@@ -206,15 +227,25 @@ class TestShowDiffCmds:
 
 # ──────────────────────────── approve ────────────────────────────
 class TestApproveCmd:
-    def _make_live_skill(self, tmp_path: Path, skill_name: str) -> Path:
-        """Create a fake hermes-agent layout with a bundled skill."""
+    def _make_live_skill(
+        self, tmp_path: Path, skill_name: str, content: Optional[str] = None
+    ) -> Path:
+        """Create a fake hermes-agent layout with a bundled skill.
+
+        When ``content`` is None, writes a default 'live body' fixture.
+        Batch B approve-path tests should pass ``content`` matching the
+        baseline text used in their ``_write_proposal(...)`` call so the
+        manifest's baseline_sha256 guard does not fire.
+        """
         root = tmp_path / "hermes-agent"
         skill_dir = root / "skills" / "test-category" / skill_name
         skill_dir.mkdir(parents=True)
         sk = skill_dir / "SKILL.md"
-        sk.write_text(
-            "---\nname: " + skill_name + "\ndescription: live skill\n---\n\nlive body\n"
-        )
+        if content is None:
+            content = (
+                "---\nname: " + skill_name + "\ndescription: live skill\n---\n\nlive body\n"
+            )
+        sk.write_text(content)
         return sk
 
     def test_approve_no_merge_just_flips_status(
@@ -247,13 +278,15 @@ class TestApproveCmd:
     def test_approve_writes_back_and_backs_up(
         self, proposals_dir: Path, tmp_path: Path, capsys
     ):
+        live_content = "---\nname: skill-a\ndescription: live skill\n---\n\nlive body\n"
         _write_proposal(
             proposals_dir,
             "skill-a",
             "20260418_100000",
+            baseline=live_content,
             evolved="---\nname: skill-a\ndescription: evolved\n---\n\nevolved body\n",
         )
-        live = self._make_live_skill(tmp_path, "skill-a")
+        live = self._make_live_skill(tmp_path, "skill-a", content=live_content)
         original = live.read_text()
         assert "live body" in original
 

@@ -32,6 +32,12 @@ from evolution.core.constraints import ConstraintValidator
 from evolution.core.regression_guard import AutoMergeGate
 from evolution.core.proposals import ProposalWriter, build_proposal_record
 from evolution.core.write_back import write_back_skill
+from evolution.core.manifest import build_manifest, write_manifest
+from evolution.core.risk import (
+    assess_risk,
+    is_auto_merge_eligible,
+    required_delta_for_tier,
+)
 from evolution.core.lm_factory import (
     make_lm,
     judge_num_threads,
@@ -647,8 +653,15 @@ def evolve(
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
 
     # ── 9b. Auto-merge gate ──────────────────────────────────────────────
+    # Risk tier comes first — CRITICAL is never auto-mergeable, HIGH needs
+    # 2× the base delta. Engine-self-evolution skills are hard-coded CRITICAL
+    # as defense-in-depth over the Batch A picker denylist.
+    risk_tier = assess_risk(skill_name)
+    tier_min_delta = required_delta_for_tier(risk_tier, min_improvement)
+    console.print(f"  Risk tier: [bold]{risk_tier.value}[/bold]  (required Δ ≥ {tier_min_delta})")
+
     gate = AutoMergeGate(
-        min_improvement=min_improvement,
+        min_improvement=tier_min_delta,
         regression_tolerance=regression_tolerance,
     )
     decision = gate.evaluate(avg_baseline, avg_evolved, evolved_pass)
@@ -665,10 +678,23 @@ def evolve(
         except Exception:
             pass  # decision dataclass may be frozen in some builds
 
+    # Risk-tier override: CRITICAL can never auto-merge even if the gate
+    # somehow approves it. Belt-and-suspenders over the hard-coded list.
+    if not is_auto_merge_eligible(risk_tier):
+        try:
+            decision.auto_merge = False
+            decision.reason = (
+                f"risk={risk_tier.value} — auto-merge forbidden, manual review only"
+            )
+        except Exception:
+            pass
+
     metrics["auto_merge"] = decision.auto_merge
     metrics["gate_reason"] = decision.reason
     metrics["regression"] = decision.regression
     metrics["mode"] = mode
+    metrics["risk_tier"] = risk_tier.value
+    metrics["required_auto_delta"] = tier_min_delta
     metrics["judge_failed"] = judge_failed
     metrics["judge_error_type"] = judge_error_type
     metrics["judge_error_message"] = judge_error_message
@@ -712,8 +738,42 @@ def evolve(
         )
         proposal_path = writer.write(record)
         metrics["proposal_path"] = str(proposal_path)
+
+        # Batch B: write manifest.json with SHA256 hashes of baseline,
+        # evolved, and diff. Enables stale-baseline / tampered-evolved
+        # detection at approve-time.
+        try:
+            diff_text = (proposal_path / "diff.patch").read_text()
+        except Exception:
+            diff_text = ""
+        manifest = build_manifest(
+            skill_name=skill_name,
+            timestamp=timestamp,
+            risk_tier=risk_tier.value,
+            baseline_text=skill["raw"],
+            evolved_text=evolved_full,
+            diff_text=diff_text,
+            extra={
+                "optimizer": selected_optimizer,
+                "optimizer_model": optimizer_model,
+                "eval_model": eval_model,
+                "inner_metric_mode": inner_metric_mode,
+                "holdout_metric_mode": os.getenv("EVOLUTION_HOLDOUT_METRIC", "judge"),
+                "required_auto_delta": tier_min_delta,
+                "judge_failed": judge_failed,
+            },
+        )
+        manifest_path = write_manifest(proposal_path, manifest)
+        metrics["manifest_path"] = str(manifest_path)
+        metrics["baseline_sha256"] = manifest.baseline_sha256
+        metrics["evolved_sha256"] = manifest.evolved_sha256
+
         (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
         console.print(f"  Proposal written: [cyan]{proposal_path}[/cyan]")
+        console.print(
+            f"  Manifest: [dim]baseline={manifest.baseline_sha256[:12]} "
+            f"evolved={manifest.evolved_sha256[:12]} risk={risk_tier.value}[/dim]"
+        )
 
     # ── 9d. Auto-mode write-back ────────────────────────────────────────
     # Only when mode=='auto' AND the gate approves do we overwrite the
