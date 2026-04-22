@@ -50,6 +50,33 @@ python -m evolution.doctor_config --judge-canary writing-plans
 - Add tests for every safety invariant.
 - Do not call `git push`, `rm -rf`, `sudo`, or pipe network content to interpreters.
 
+## Claude Code delegate profiles (Commit 1)
+
+Canonical profiles Hermes automation should use:
+
+- `smoke` — prove wrapper → delegate → Claude Code → subscription auth → output/log works
+- `plan_minimal` — default planning mode; Read-only, no Bash/Grep/Glob/MCP, no slash commands, no session persistence
+- `plan_files` — planning with explicit file list only; still Read-only and no Bash
+- `patch_worktree` — implementation mode; worktree required, bounded Bash for tests only
+- `review` — read-only code/safety review after changes
+
+Compatibility aliases may exist in the delegate (`plan` → `plan_minimal`, `patch` → `patch_worktree`) but Hermes automation should prefer the canonical names above.
+
+Stable minimal settings file used by planning profiles:
+
+- `~/.hermes/claude-code/minimal-settings.json`
+- override via `HERMES_CLAUDE_MINIMAL_SETTINGS`
+
+Valid empty strict MCP config for the installed Claude Code CLI is:
+
+```bash
+--strict-mcp-config --mcp-config '{"mcpServers":{}}'
+```
+
+Do **not** use `--mcp-config '{}'` on this machine — 2.1.116 rejects it as invalid schema.
+
+Do **not** use `--bare` for the Max-subscription path — it skips OAuth/keychain reads and pushes auth toward API-key style flows, which conflicts with the Claude Max wrapper policy.
+
 ## Batch C scope (when asked to implement)
 
 1. Paired-win holdout evaluation with randomized A/B order
