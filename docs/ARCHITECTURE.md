@@ -71,7 +71,7 @@ tests/
     └── test_skill_module.py
 ```
 
-218 tests, all green. Every core module has dedicated unit coverage; review
+255 tests, all green. Every core module has dedicated unit coverage; review
 layer has integration-style tests over a temp `proposals/` fixture.
 
 ---

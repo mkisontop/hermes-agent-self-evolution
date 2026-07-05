@@ -2,7 +2,7 @@
 
 import pytest
 from pathlib import Path
-from evolution.skills.skill_module import load_skill, reassemble_skill
+from evolution.skills.skill_module import find_skill, load_skill, reassemble_skill
 
 
 SAMPLE_SKILL = """---
@@ -61,6 +61,45 @@ class TestLoadSkill:
         skill = load_skill(skill_file)
 
         assert skill["path"] == skill_file
+
+
+def _make_skill(root: Path, dirname: str, name: str) -> Path:
+    skill_dir = root / "skills" / "misc" / dirname
+    skill_dir.mkdir(parents=True)
+    path = skill_dir / "SKILL.md"
+    path.write_text(f"---\nname: {name}\ndescription: A {name} skill\n---\n\n# {name}\n")
+    return path
+
+
+class TestFindSkill:
+    def test_direct_directory_match(self, tmp_path):
+        path = _make_skill(tmp_path, "my-skill", "my-skill")
+        assert find_skill("my-skill", tmp_path) == path
+
+    def test_frontmatter_name_match(self, tmp_path):
+        path = _make_skill(tmp_path, "some-dir", "actual-name")
+        assert find_skill("actual-name", tmp_path) == path
+
+    def test_name_prefix_does_not_match(self, tmp_path):
+        """Searching 'git' must NOT match a skill named 'github-code-review' —
+        the old substring check returned the wrong skill here."""
+        _make_skill(tmp_path, "github-code-review", "github-code-review")
+        assert find_skill("git", tmp_path) is None
+
+    def test_exact_name_wins_over_prefix_sibling(self, tmp_path):
+        _make_skill(tmp_path, "github-code-review", "github-code-review")
+        git_path = _make_skill(tmp_path, "git-dir", "git")
+        assert find_skill("git", tmp_path) == git_path
+
+    def test_quoted_frontmatter_name(self, tmp_path):
+        skill_dir = tmp_path / "skills" / "quoted-dir"
+        skill_dir.mkdir(parents=True)
+        path = skill_dir / "SKILL.md"
+        path.write_text('---\nname: "quoted-name"\ndescription: x\n---\n\nbody\n')
+        assert find_skill("quoted-name", tmp_path) == path
+
+    def test_missing_skills_dir(self, tmp_path):
+        assert find_skill("anything", tmp_path) is None
 
 
 class TestReassembleSkill:

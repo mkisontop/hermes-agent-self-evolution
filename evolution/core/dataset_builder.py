@@ -40,6 +40,48 @@ class EvalExample:
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
 
+def split_examples(
+    examples: list["EvalExample"],
+    train_ratio: float = 0.5,
+    val_ratio: float = 0.25,
+    seed: Optional[int] = None,
+) -> "EvalDataset":
+    """Shuffle and split examples into train/val/holdout.
+
+    Guarantees every split is non-empty whenever there are >= 3 examples
+    (a naive ``max(1, int(n * ratio))`` split can leave holdout empty for
+    small n, which crashes holdout evaluation downstream). With 1-2
+    examples, priority is train, then holdout, then val — holdout is what
+    the regression gate scores against, so it outranks val.
+    """
+    examples = list(examples)
+    rng = random.Random(seed) if seed is not None else random
+    rng.shuffle(examples)
+
+    n = len(examples)
+    if n == 0:
+        return EvalDataset()
+    if n == 1:
+        return EvalDataset(train=examples)
+    if n == 2:
+        return EvalDataset(train=examples[:1], holdout=examples[1:])
+
+    n_train = max(1, int(n * train_ratio))
+    n_val = max(1, int(n * val_ratio))
+    # Leave at least one example for holdout.
+    while n_train + n_val >= n and n_train + n_val > 2:
+        if n_val > 1:
+            n_val -= 1
+        else:
+            n_train -= 1
+
+    return EvalDataset(
+        train=examples[:n_train],
+        val=examples[n_train:n_train + n_val],
+        holdout=examples[n_train + n_val:],
+    )
+
+
 @dataclass
 class EvalDataset:
     """Train/val/holdout split of evaluation examples."""
@@ -156,16 +198,10 @@ class SyntheticDatasetBuilder:
             if c.get("task_input") and c.get("expected_behavior")
         ]
 
-        # Shuffle and split
-        random.shuffle(examples)
-        n_total = len(examples)
-        n_train = max(1, int(n_total * self.config.train_ratio))
-        n_val = max(1, int(n_total * self.config.val_ratio))
-
-        return EvalDataset(
-            train=examples[:n_train],
-            val=examples[n_train:n_train + n_val],
-            holdout=examples[n_train + n_val:],
+        return split_examples(
+            examples,
+            train_ratio=self.config.train_ratio,
+            val_ratio=self.config.val_ratio,
         )
 
 
@@ -189,13 +225,4 @@ class GoldenDatasetLoader:
                 if line.strip():
                     examples.append(EvalExample.from_dict(json.loads(line)))
 
-        random.shuffle(examples)
-        n = len(examples)
-        n_train = max(1, int(n * 0.5))
-        n_val = max(1, int(n * 0.25))
-
-        return EvalDataset(
-            train=examples[:n_train],
-            val=examples[n_train:n_train + n_val],
-            holdout=examples[n_train + n_val:],
-        )
+        return split_examples(examples)

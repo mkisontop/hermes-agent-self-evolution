@@ -2,11 +2,20 @@
 
 Uses LLM-as-judge with rubrics to score agent outputs.
 Supports length penalties and multi-dimensional scoring.
+
+The core metric, ``skill_fitness_metric``, is GEPA-compatible: GEPA invokes
+metrics with ``(gold, pred, trace, pred_name, pred_trace)`` and uses the
+returned *textual feedback* to drive reflective mutation — the feedback
+tells the reflection LM exactly which expectations the candidate missed,
+so mutations are targeted rather than random. When called by plain
+``dspy.Evaluate`` (3 args), it returns a bare float.
 """
 
-import dspy
+import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
+
+import dspy
 
 from evolution.core.config import EvolutionConfig
 
@@ -104,43 +113,92 @@ class LLMJudge:
         )
 
 
-def skill_fitness_metric(example: dspy.Example, prediction: dspy.Prediction, trace=None) -> float:
-    """DSPy-compatible metric function for skill optimization.
+# Words too common to signal that the output actually addressed the rubric.
+_STOPWORDS = frozenset("""
+a an and are as at be but by for from has have if in into is it its of on or
+should that the their then there these this to was what when which will with
+would you your
+""".split())
 
-    This is what gets passed to dspy.GEPA(metric=...).
-    Returns a float 0-1 score.
+
+def _keywords(text: str) -> set[str]:
+    """Meaningful lowercase words from a text (stopwords and short tokens dropped)."""
+    words = re.findall(r"[a-z0-9][a-z0-9_-]{2,}", text.lower())
+    return {w for w in words if w not in _STOPWORDS}
+
+
+def skill_fitness_metric(
+    gold: dspy.Example,
+    pred: dspy.Prediction,
+    trace=None,
+    pred_name: Optional[str] = None,
+    pred_trace=None,
+) -> Union[float, dspy.Prediction]:
+    """DSPy metric for skill optimization — GEPA and Evaluate compatible.
+
+    GEPA calls this with all five arguments and uses the returned
+    ``feedback`` text for reflective mutation; ``dspy.Evaluate`` calls it
+    with the first three and needs a plain float.
+
+    Scoring is a fast keyword-recall proxy: what fraction of the rubric's
+    meaningful vocabulary appears in the agent's output. Full LLM-as-judge
+    scoring (``LLMJudge``) is reserved for holdout evaluation where the
+    extra cost is justified.
     """
-    # The prediction should have an 'output' field with the agent's response
-    agent_output = getattr(prediction, "output", "") or ""
-    expected = getattr(example, "expected_behavior", "") or ""
-    task = getattr(example, "task_input", "") or ""
+    agent_output = getattr(pred, "output", "") or ""
+    expected = getattr(gold, "expected_behavior", "") or ""
 
     if not agent_output.strip():
-        return 0.0
+        score, feedback = 0.0, "The response was empty. Produce a substantive answer."
+    else:
+        expected_kw = _keywords(expected)
+        if not expected_kw:
+            # No rubric vocabulary to check against — non-empty output gets
+            # a neutral pass.
+            score, feedback = 0.5, "No rubric keywords available; scored neutrally."
+        else:
+            output_kw = _keywords(agent_output)
+            covered = expected_kw & output_kw
+            missing = expected_kw - output_kw
+            recall = len(covered) / len(expected_kw)
+            score = 0.3 + 0.7 * recall
+            if missing:
+                feedback = (
+                    f"The response covered {len(covered)}/{len(expected_kw)} rubric concepts. "
+                    f"Expected behavior: {expected[:300]} "
+                    f"Missing concepts: {', '.join(sorted(missing)[:15])}."
+                )
+            else:
+                feedback = "The response covered all rubric concepts."
 
-    # Quick heuristic scoring (for speed during optimization)
-    # Full LLM-as-judge scoring is expensive — use it selectively
-    score = 0.5  # Base score for non-empty output
+    score = min(1.0, max(0.0, score))
 
-    # Check if key phrases from expected behavior appear
-    expected_lower = expected.lower()
-    output_lower = agent_output.lower()
-
-    # Simple keyword overlap as a fast proxy
-    expected_words = set(expected_lower.split())
-    output_words = set(output_lower.split())
-    if expected_words:
-        overlap = len(expected_words & output_words) / len(expected_words)
-        score = 0.3 + (0.7 * overlap)
-
-    return min(1.0, max(0.0, score))
+    if pred_name is not None:
+        # GEPA reflective path: feedback guides the next mutation.
+        return dspy.Prediction(score=score, feedback=feedback)
+    return score
 
 
 def _parse_score(value) -> float:
-    """Parse a score value, handling various LLM output formats."""
-    if isinstance(value, (int, float)):
-        return min(1.0, max(0.0, float(value)))
-    try:
-        return min(1.0, max(0.0, float(str(value).strip())))
-    except (ValueError, TypeError):
-        return 0.5  # Default to neutral on parse failure
+    """Parse a score value, handling various LLM output formats.
+
+    Accepts floats, ints, "0.85", "85%", and "8/10"; values in (1, 100]
+    are treated as percentages.
+    """
+    if not isinstance(value, (int, float)):
+        text = str(value).strip()
+        m = re.match(r"^([0-9]*\.?[0-9]+)\s*/\s*([0-9]*\.?[0-9]+)$", text)
+        try:
+            if m and float(m.group(2)) > 0:
+                value = float(m.group(1)) / float(m.group(2))
+            else:
+                value = float(text.rstrip("%"))
+                if text.endswith("%"):
+                    value /= 100.0
+        except (ValueError, TypeError):
+            return 0.5  # Default to neutral on parse failure
+
+    value = float(value)
+    if 1.0 < value <= 100.0:
+        value /= 100.0  # LLM answered on a percentage scale
+    return min(1.0, max(0.0, value))

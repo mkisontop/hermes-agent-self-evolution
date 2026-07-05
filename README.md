@@ -190,7 +190,7 @@ weekly or before a release to exercise the expensive t4 path.
 
 Every evolved variant must pass:
 
-1. **Full test suite** — `pytest tests/ -q` must pass 100% (218 tests).
+1. **Full test suite** — `pytest tests/ -q` must pass 100% (255 tests).
 2. **Size limits** — Skills ≤15KB, tool descriptions ≤500 chars.
 3. **Frontmatter validation** — YAML front-matter preserved and valid.
 4. **Semantic preservation** — Name/description slugs unchanged.
@@ -223,7 +223,7 @@ self-evolution/
 │   ├── tools/           # Phase 2 (planned)
 │   ├── code/            # Phase 4 (planned)
 │   └── monitor/         # Phase 5 (planned)
-├── tests/               # 218 tests, all green
+├── tests/               # 255 tests, all green
 ├── smoke_test.sh        # 5-tier smoke harness
 ├── nightly.sh           # 3-phase nightly orchestrator
 ├── run_evolution.sh     # Legacy single-shot runner

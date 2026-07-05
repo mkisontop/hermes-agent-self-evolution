@@ -33,7 +33,7 @@ import dspy
 from rich.console import Console
 from rich.progress import Progress
 
-from evolution.core.dataset_builder import EvalExample, EvalDataset
+from evolution.core.dataset_builder import EvalExample, EvalDataset, split_examples
 
 console = Console()
 
@@ -303,11 +303,11 @@ def _parse_copilot_events(
                                 "session_id": session_id,
                             })
 
-                    current_user_msg = data.get("content", "")
+                    current_user_msg = _coerce_content_to_text(data.get("content", ""))
                     current_assistant_msg = None
 
                 elif event_type == "assistant.message":
-                    content = data.get("content", "")
+                    content = _coerce_content_to_text(data.get("content", ""))
                     if content and current_user_msg:
                         if current_assistant_msg:
                             current_assistant_msg += "\n" + content
@@ -329,6 +329,26 @@ def _parse_copilot_events(
         console.print(f"[dim]Skipped {session_id}: {e}[/dim]")
 
     return pairs
+
+
+def _coerce_content_to_text(content) -> str:
+    """Flatten OpenAI-style message content to plain text.
+
+    Session files may store ``content`` as a plain string or as a list of
+    content blocks (``[{"type": "text", "text": ...}, ...]``). Anything
+    non-textual (images, tool payloads) is dropped.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and isinstance(block.get("text"), str):
+                parts.append(block["text"])
+        return "\n".join(parts)
+    return ""
 
 
 class HermesSessionImporter:
@@ -383,7 +403,7 @@ class HermesSessionImporter:
             for i, msg in enumerate(msg_list):
                 if msg.get("role") != "user":
                     continue
-                user_text = msg.get("content", "")
+                user_text = _coerce_content_to_text(msg.get("content", ""))
                 if not user_text or len(user_text) < 10:
                     continue
                 if _contains_secret(user_text):
@@ -393,7 +413,7 @@ class HermesSessionImporter:
                 assistant_text = ""
                 for j in range(i + 1, len(msg_list)):
                     if msg_list[j].get("role") == "assistant":
-                        content = msg_list[j].get("content", "")
+                        content = _coerce_content_to_text(msg_list[j].get("content", ""))
                         if content:
                             assistant_text = content
                             break
@@ -669,16 +689,7 @@ def build_dataset_from_external(
         )
 
     # Split into train/val/holdout (50/25/25)
-    random.shuffle(examples)
-    n = len(examples)
-    n_train = max(1, int(n * 0.5))
-    n_val = max(1, int(n * 0.25))
-
-    dataset = EvalDataset(
-        train=examples[:n_train],
-        val=examples[n_train:n_train + n_val],
-        holdout=examples[n_train + n_val:],
-    )
+    dataset = split_examples(examples)
 
     dataset.save(output_path)
     console.print(f"\n[bold]Saved to {output_path}/[/bold]")

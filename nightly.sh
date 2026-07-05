@@ -9,11 +9,14 @@
 # Defaults are safe. Override via env vars:
 #   SKILL=github-code-review
 #   ITERATIONS=10
-#   MODE=propose           (propose | auto)
-#   SKIP_SMOKE=0           (1 to bypass preflight)
-#   SKIP_EVOLVE=0          (1 to only build digest)
-#   WINDOW_HOURS=24
-#   DELIVER=0              (1 to send digest via send_message; requires HERMES_CLI)
+#   MODE=propose                     (propose | auto)
+#   OPTIMIZER_MODEL=openai/cx/gpt-5.4  (GEPA reflection LM)
+#   EVAL_MODEL=openai/cx/gpt-5.4       (scoring LM)
+#   SKIP_SMOKE=0                     (1 to bypass preflight)
+#   SKIP_EVOLVE=0                    (1 to only build digest)
+#   SKIP_DIGEST=0                    (1 to skip digest phase)
+#   DIGEST_WINDOW_HOURS=24
+#   DELIVER=0                        (1 to run DELIVER_CMD on the digest)
 
 set -euo pipefail
 
@@ -30,11 +33,16 @@ source venv/bin/activate
 
 SKILL="${SKILL:-github-code-review}"
 ITERATIONS="${ITERATIONS:-10}"
+# MODEL kept as a legacy alias; OPTIMIZER_MODEL / EVAL_MODEL take precedence.
 MODEL="${MODEL:-openai/cx/gpt-5.4}"
+OPTIMIZER_MODEL="${OPTIMIZER_MODEL:-$MODEL}"
+EVAL_MODEL="${EVAL_MODEL:-$MODEL}"
 MODE="${MODE:-propose}"
-WINDOW_HOURS="${WINDOW_HOURS:-24}"
+# WINDOW_HOURS kept as a legacy alias for DIGEST_WINDOW_HOURS.
+WINDOW_HOURS="${DIGEST_WINDOW_HOURS:-${WINDOW_HOURS:-24}}"
 SKIP_SMOKE="${SKIP_SMOKE:-0}"
 SKIP_EVOLVE="${SKIP_EVOLVE:-0}"
+SKIP_DIGEST="${SKIP_DIGEST:-0}"
 DELIVER="${DELIVER:-0}"
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
@@ -61,7 +69,7 @@ fail() {
 }
 
 log "=== Hermes self-evolution nightly ==="
-log "skill=$SKILL iters=$ITERATIONS mode=$MODE model=$MODEL window=${WINDOW_HOURS}h"
+log "skill=$SKILL iters=$ITERATIONS mode=$MODE optimizer=$OPTIMIZER_MODEL eval=$EVAL_MODEL window=${WINDOW_HOURS}h"
 log "nightly log: $NIGHTLY_LOG"
 
 # ─── phase 1: smoke preflight ─────────────────────────────────────────────────
@@ -92,8 +100,8 @@ else
     python -m evolution.skills.evolve_skill \
         --skill "$SKILL" \
         --iterations "$ITERATIONS" \
-        --optimizer-model "$MODEL" \
-        --eval-model "$MODEL" \
+        --optimizer-model "$OPTIMIZER_MODEL" \
+        --eval-model "$EVAL_MODEL" \
         --mode "$MODE" \
         >>"$EVOLVE_LOG" 2>&1
     EVOLVE_EXIT=$?
@@ -106,19 +114,24 @@ else
 fi
 
 # ─── phase 3: digest ──────────────────────────────────────────────────────────
-log "Phase 3: build digest (window=${WINDOW_HOURS}h → $DIGEST_FILE)"
-set +e
-python -m evolution.review.digest \
-    --hours "$WINDOW_HOURS" \
-    --output "$DIGEST_FILE" \
-    --format markdown \
-    >>"$NIGHTLY_LOG" 2>&1
-DIGEST_EXIT=$?
-set -e
-if [[ "$DIGEST_EXIT" -ne 0 ]]; then
-    log "  digest failed (exit $DIGEST_EXIT) — see $NIGHTLY_LOG"
+DIGEST_EXIT=0
+if [[ "$SKIP_DIGEST" == "1" ]]; then
+    log "Phase 3 (digest) skipped via SKIP_DIGEST=1"
 else
-    log "  digest OK — $DIGEST_FILE"
+    log "Phase 3: build digest (window=${WINDOW_HOURS}h → $DIGEST_FILE)"
+    set +e
+    python -m evolution.review.digest \
+        --hours "$WINDOW_HOURS" \
+        --output "$DIGEST_FILE" \
+        --format markdown \
+        >>"$NIGHTLY_LOG" 2>&1
+    DIGEST_EXIT=$?
+    set -e
+    if [[ "$DIGEST_EXIT" -ne 0 ]]; then
+        log "  digest failed (exit $DIGEST_EXIT) — see $NIGHTLY_LOG"
+    else
+        log "  digest OK — $DIGEST_FILE"
+    fi
 fi
 
 # ─── phase 4: delivery (optional) ─────────────────────────────────────────────

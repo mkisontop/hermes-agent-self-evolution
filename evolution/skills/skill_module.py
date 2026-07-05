@@ -70,14 +70,18 @@ def find_skill(skill_name: str, hermes_agent_path: Path) -> Optional[Path]:
         if skill_md.parent.name == skill_name:
             return skill_md
 
-    # Fuzzy match: check the name field in frontmatter
+    # Frontmatter match: parse the `name:` field and require an exact match.
+    # (A substring check like `"name: git" in content` would wrongly match
+    # skills such as `name: github-code-review`.)
+    name_re = re.compile(r"^\s*name:\s*(.+?)\s*$", re.MULTILINE)
     for skill_md in skills_dir.rglob("SKILL.md"):
         try:
             content = skill_md.read_text()[:500]
-            if f"name: {skill_name}" in content or f'name: "{skill_name}"' in content:
-                return skill_md
         except Exception:
             continue
+        m = name_re.search(content)
+        if m and m.group(1).strip("'\"") == skill_name:
+            return skill_md
 
     return None
 

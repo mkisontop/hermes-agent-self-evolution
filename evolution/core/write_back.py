@@ -90,8 +90,12 @@ def write_back_skill(
 
     # 2. Atomic overwrite: write to temp, rename into place.
     tmp_path = live_path.with_suffix(live_path.suffix + ".tmp")
-    tmp_path.write_text(evolved_text)
-    tmp_path.replace(live_path)  # atomic on POSIX
+    try:
+        tmp_path.write_text(evolved_text)
+        tmp_path.replace(live_path)  # atomic on POSIX
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
     return WriteBackResult(
         merged=True,

@@ -62,17 +62,18 @@ def evolve(
     )
     if hermes_repo:
         config.hermes_agent_path = Path(hermes_repo)
+    hermes_path = config.require_hermes_agent_path()
 
     # ── 1. Find and load the skill ──────────────────────────────────────
     console.print(f"\n[bold cyan]🧬 Hermes Agent Self-Evolution[/bold cyan] — Evolving skill: [bold]{skill_name}[/bold]\n")
 
-    skill_path = find_skill(skill_name, config.hermes_agent_path)
+    skill_path = find_skill(skill_name, hermes_path)
     if not skill_path:
-        console.print(f"[red]✗ Skill '{skill_name}' not found in {config.hermes_agent_path / 'skills'}[/red]")
+        console.print(f"[red]✗ Skill '{skill_name}' not found in {hermes_path / 'skills'}[/red]")
         sys.exit(1)
 
     skill = load_skill(skill_path)
-    console.print(f"  Loaded: {skill_path.relative_to(config.hermes_agent_path)}")
+    console.print(f"  Loaded: {skill_path.relative_to(hermes_path)}")
     console.print(f"  Name: {skill['name']}")
     console.print(f"  Size: {len(skill['raw']):,} chars")
     console.print(f"  Description: {skill['description'][:80]}...")
@@ -157,24 +158,40 @@ def evolve(
     valset = dataset.to_dspy_examples("val")
 
     # ── 5. Run GEPA optimization ────────────────────────────────────────
-    console.print(f"\n[bold cyan]Running GEPA optimization ({iterations} iterations)...[/bold cyan]\n")
+    console.print(f"\n[bold cyan]Running GEPA optimization ({iterations} full evals)...[/bold cyan]\n")
 
     start_time = time.time()
 
+    # GEPA's reflective evolution needs its own (stronger) LM for mutation
+    # proposals — this is where --optimizer-model is actually consumed.
+    # The reflection LM reads execution traces + metric feedback and
+    # rewrites the skill text; Pareto candidate selection keeps a frontier
+    # of variants rather than greedily committing to one lineage.
+    reflection_lm = dspy.LM(
+        optimizer_model, temperature=1.0, max_tokens=16_000,
+        timeout=180, num_retries=2,
+    )
+
+    optimizer_used = "gepa"
     try:
         optimizer = dspy.GEPA(
             metric=skill_fitness_metric,
-            max_steps=iterations,
+            max_full_evals=iterations,
+            reflection_lm=reflection_lm,
+            candidate_selection_strategy="pareto",
+            num_threads=4,
         )
-
         optimized_module = optimizer.compile(
             baseline_module,
             trainset=trainset,
             valset=valset,
         )
-    except Exception as e:
-        # Fall back to MIPROv2 if GEPA isn't available in this DSPy version
-        console.print(f"[yellow]GEPA not available ({e}), falling back to MIPROv2[/yellow]")
+    except (TypeError, AttributeError) as e:
+        # Fall back to MIPROv2 only on API incompatibility with the
+        # installed DSPy version — runtime errors (bad model, network)
+        # should surface, not silently switch optimizers.
+        console.print(f"[yellow]GEPA unavailable in this DSPy version ({e}) — falling back to MIPROv2[/yellow]")
+        optimizer_used = "miprov2"
         optimizer = dspy.MIPROv2(
             metric=skill_fitness_metric,
             auto="light",
@@ -185,7 +202,7 @@ def evolve(
         )
 
     elapsed = time.time() - start_time
-    console.print(f"\n  Optimization completed in {elapsed:.1f}s")
+    console.print(f"\n  Optimization completed in {elapsed:.1f}s (optimizer: {optimizer_used})")
 
     # ── 6. Extract evolved skill text ───────────────────────────────────
     # The Predictor's signature.instructions IS the optimizable parameter
@@ -196,9 +213,9 @@ def evolve(
     # ── 7. Validate evolved skill ───────────────────────────────────────
     console.print(f"\n[bold]Validating evolved skill[/bold]")
     # Validate the reassembled full skill (frontmatter + body) so structure
-    # checks like YAML frontmatter presence can pass. Growth check still
-    # compares body-only against baseline body-only via baseline_text.
-    evolved_constraints = validator.validate_all(evolved_full, "skill", baseline_text=skill["body"])
+    # checks like YAML frontmatter presence can pass. The growth check must
+    # compare like with like: full evolved text against full baseline text.
+    evolved_constraints = validator.validate_all(evolved_full, "skill", baseline_text=skill["raw"])
     evolved_pass = True
     for c in evolved_constraints:
         icon = "✓" if c.passed else "✗"
@@ -217,9 +234,18 @@ def evolve(
         return
 
     # ── 8. Evaluate on holdout set ──────────────────────────────────────
-    console.print(f"\n[bold]Evaluating on holdout set ({len(dataset.holdout)} examples)[/bold]")
-
-    holdout_examples = dataset.to_dspy_examples("holdout")
+    # The gate must score on examples the optimizer never saw. If the
+    # holdout split is empty (tiny dataset), fall back to val with a
+    # warning rather than crashing on an empty devset.
+    eval_split = "holdout"
+    if not dataset.holdout:
+        eval_split = "val" if dataset.val else "train"
+        console.print(
+            f"[yellow]⚠ Holdout split is empty — gating on the '{eval_split}' split. "
+            f"Scores may be optimistic; provide more eval examples.[/yellow]"
+        )
+    holdout_examples = dataset.to_dspy_examples(eval_split)
+    console.print(f"\n[bold]Evaluating on {eval_split} set ({len(holdout_examples)} examples)[/bold]")
 
     # Use dspy.Evaluate for parallel, progress-visible, error-tolerant holdout
     # scoring. Prior serial loop silently hung on any single slow LLM call
@@ -237,11 +263,13 @@ def evolve(
         baseline_result = evaluator(baseline_module)
         evolved_result = evaluator(optimized_module)
 
-    # EvaluationResult.score is already a % (0-100) in current DSPy;
-    # normalize to 0-1 to match prior semantics and downstream gate inputs.
+    # EvaluationResult.score is a percentage (0-100) in current DSPy;
+    # normalize to 0-1 to match downstream gate inputs. (The old
+    # `s / 100 if s > 1 else s` heuristic mapped a genuine 1% to 100%.)
     def _norm(r):
-        s = getattr(r, "score", r)
-        return s / 100.0 if s > 1.0 else s
+        if hasattr(r, "score"):
+            return r.score / 100.0
+        return float(r)
 
     avg_baseline = _norm(baseline_result)
     avg_evolved = _norm(evolved_result)
@@ -284,13 +312,16 @@ def evolve(
     # Save baseline for comparison
     (output_dir / "baseline_skill.md").write_text(skill["raw"])
 
-    # Save metrics
+    # Save metrics. `_save_metrics` re-serializes after each later update so
+    # a crash mid-run still leaves the latest state on disk.
     metrics = {
         "skill_name": skill_name,
         "timestamp": timestamp,
         "iterations": iterations,
+        "optimizer": optimizer_used,
         "optimizer_model": optimizer_model,
         "eval_model": eval_model,
+        "eval_split": eval_split,
         "baseline_score": avg_baseline,
         "evolved_score": avg_evolved,
         "improvement": improvement,
@@ -302,7 +333,11 @@ def evolve(
         "elapsed_seconds": elapsed,
         "constraints_passed": evolved_pass,
     }
-    (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+
+    def _save_metrics():
+        (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+
+    _save_metrics()
 
     # ── 9b. Auto-merge gate ──────────────────────────────────────────────
     gate = AutoMergeGate(
@@ -314,7 +349,7 @@ def evolve(
     metrics["gate_reason"] = decision.reason
     metrics["regression"] = decision.regression
     metrics["mode"] = mode
-    (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+    _save_metrics()
 
     console.print(f"\n[bold]Gate decision:[/bold] {decision.reason}")
 
@@ -351,7 +386,7 @@ def evolve(
         )
         proposal_path = writer.write(record)
         metrics["proposal_path"] = str(proposal_path)
-        (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+        _save_metrics()
         console.print(f"  Proposal written: [cyan]{proposal_path}[/cyan]")
 
     # ── 9d. Auto-mode write-back ────────────────────────────────────────
@@ -372,10 +407,9 @@ def evolve(
         console.print(f"  Backup: [cyan]{wb_result.backup_path}[/cyan]")
         metrics["merged_to"] = str(wb_result.live_path)
         metrics["backup_path"] = str(wb_result.backup_path)
-        (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
     else:
         metrics["merged_to"] = None
-        (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+    _save_metrics()
 
     if decision.regression:
         if mode == "propose":
