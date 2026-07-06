@@ -366,12 +366,23 @@ class TestDelayedPaperExecutor:
         res = ex.execute(self._opp(size=10, price=0.40))
         assert not res.success
         assert res.legs[0].filled_size == pytest.approx(4)
-        assert "NOT fill" in res.note
+        assert "filled=0.400" in res.note
 
-    def test_price_moved_above_limit_no_fill(self):
+    def test_price_moved_pays_up_while_profitable(self):
+        # detected at 0.40 (payout 1.0/share); books moved to 0.45 —
+        # still profitable, so a live executor pays up and fills
         from polyarb.execution import DelayedPaperExecutor
 
         st = self._store_with_book(asks=[(0.45, 100)])
+        ex = DelayedPaperExecutor(lambda: st, delay_ms=0)
+        res = ex.execute(self._opp(size=10, price=0.40))
+        assert res.success
+        assert "realized_profit=5.5000" in res.note  # 10*(1-0.45)
+
+    def test_price_moved_beyond_profitability_no_fill(self):
+        from polyarb.execution import DelayedPaperExecutor
+
+        st = self._store_with_book(asks=[(1.01, 100)])
         ex = DelayedPaperExecutor(lambda: st, delay_ms=0)
         res = ex.execute(self._opp(size=10, price=0.40))
         assert not res.success and res.legs[0].filled_size == 0
@@ -385,9 +396,10 @@ class TestDelayedPaperExecutor:
         opp = Opportunity(
             kind=ArbKind.NEGRISK_LONG_NO,
             legs=[Leg("noA", Side.BUY, 0.70, size=30)],
-            size=30, gross_cost=21.0, payout=0.0, fees=0.0,
-            edge_per_share=0.0, profit=0.0,
+            size=30, gross_cost=21.0, payout=30.0, fees=0.0,
+            edge_per_share=0.30, profit=9.0,
         )
         ex = DelayedPaperExecutor(lambda: st, delay_ms=0)
         res = ex.execute(opp)
+        assert res.success
         assert res.legs[0].filled_size == pytest.approx(30)

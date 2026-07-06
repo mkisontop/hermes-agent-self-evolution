@@ -133,51 +133,70 @@ class DelayedPaperExecutor:
         self._provider = book_provider
         self.delay_ms = delay_ms
 
-    def _available_at_limit(self, store, leg: Leg) -> float:
+    def _delayed_ladder(self, store, leg: Leg):
         yes, mirrored = store.resolve(leg.token_id)
         books = store.get_books([yes])
         if books is None:
-            return 0.0
+            return None
         book = books[yes]
         from .arbmath import mirror_ladder  # local: avoid cycle at import
 
-        ladder = mirror_ladder(book.bids) if mirrored else book.asks
-        avail = 0.0
-        for lv in ladder:
-            if lv.price > leg.price + 1e-9:
-                break
-            avail += lv.size
-        return avail
+        return mirror_ladder(book.bids) if mirrored else book.asks
 
     def execute(self, opp: Opportunity) -> ExecutionResult:
+        """Re-walk the basket on the delayed books, like a live executor.
+
+        Rather than demanding the exact detected prices still rest
+        (prices wiggle by a tick constantly), buy up to the detected
+        size at whatever the books offer ``delay_ms`` later, as long as
+        each marginal basket-share stays profitable against the net
+        payout. Reported profit is the *realized* profit at t+delay.
+        """
         t0 = time.time()
         if self.delay_ms > 0:
             time.sleep(self.delay_ms / 1000.0)
         store = self._provider()
-        legs = []
-        fillable = []
+        ladders = []
         for leg in opp.legs:
-            avail = self._available_at_limit(store, leg)
-            frac = min(1.0, avail / leg.size) if leg.size > 0 else 0.0
-            fillable.append(frac)
-            legs.append(
-                LegResult(
-                    token_id=leg.token_id,
-                    ok=avail >= leg.size * 0.999,
-                    filled_size=min(avail, leg.size),
+            lad = self._delayed_ladder(store, leg)
+            if lad is None:
+                return ExecutionResult(
+                    mode=self.mode, success=False,
+                    legs=[LegResult(l.token_id, ok=False, error="no book")
+                          for l in opp.legs],
+                    started_at=t0, elapsed_ms=(time.time() - t0) * 1000,
+                    note=f"delay={self.delay_ms:.0f}ms books unavailable",
                 )
+            ladders.append(lad)
+        from .arbmath import walk_buy_basket  # local: avoid cycle at import
+
+        payout_net = (opp.payout - opp.fees) / opp.size if opp.size else 0.0
+        fill = walk_buy_basket(
+            ladders,
+            payout_per_share=payout_net,
+            min_edge_per_share=0.0,
+            max_shares=opp.size,
+        )
+        shares = fill.shares if fill else 0.0
+        realized = fill.profit if fill else 0.0
+        frac = shares / opp.size if opp.size else 0.0
+        legs = [
+            LegResult(
+                token_id=opp.legs[i].token_id,
+                ok=frac >= 0.999,
+                filled_size=shares,
             )
-        basket_frac = min(fillable) if fillable else 0.0
-        success = basket_frac >= 0.999
+            for i in range(len(opp.legs))
+        ]
         return ExecutionResult(
             mode=self.mode,
-            success=success,
+            success=frac >= 0.999,
             legs=legs,
             started_at=t0,
             elapsed_ms=(time.time() - t0) * 1000,
             note=(
-                f"delay={self.delay_ms:.0f}ms basket_fillable={basket_frac:.3f}"
-                + ("" if success else " (FOK basket would NOT fill fully)")
+                f"delay={self.delay_ms:.0f}ms filled={frac:.3f} "
+                f"realized_profit={realized:.4f} vs detected={opp.profit:.4f}"
             ),
         )
 
