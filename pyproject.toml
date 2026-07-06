@@ -20,6 +20,7 @@ dependencies = [
     "pyyaml>=6.0",
     "click>=8.0",
     "rich>=13.0",
+    "requests>=2.28",
 ]
 
 [project.optional-dependencies]
@@ -30,13 +31,18 @@ dev = [
 darwinian = [
     "darwinian-evolver",
 ]
+# live order placement for the polyarb Polymarket arbitrage bot
+# (scanning/paper modes need only `requests`)
+polyarb-live = [
+    "py-clob-client-v2",
+]
 
 [project.urls]
 Homepage = "https://github.com/NousResearch/hermes-agent-self-evolution"
 Repository = "https://github.com/NousResearch/hermes-agent-self-evolution"
 
 [tool.setuptools.packages.find]
-include = ["evolution*"]
+include = ["evolution*", "polyarb*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

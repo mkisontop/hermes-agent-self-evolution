@@ -203,6 +203,16 @@ Every evolved variant must pass:
 
 ---
 
+## Side Project: polyarb
+
+[`polyarb/`](polyarb/README.md) is a self-contained Polymarket
+negative-risk arbitrage bot (scanner + paper/live executor) that lives
+in this repo on its own branch line. It shares no code with the
+evolution pipeline — see its README for strategy research, math, and
+usage.
+
+---
+
 ## Documentation
 
 - **[PLAN.md](PLAN.md)** — Full architecture plan, roadmap, design decisions.

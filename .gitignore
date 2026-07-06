@@ -24,6 +24,10 @@ logs/
 output/
 proposals/
 
+# polyarb bot runtime artifacts
+polyarb_data/
+polyarb.KILL
+
 # IDE
 .idea/
 .vscode/
