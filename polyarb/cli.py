@@ -50,11 +50,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp_mon.add_argument("--interval", type=float, default=5.0)
     sp_mon.add_argument("--duration", type=float, default=None,
                         help="seconds to run (default: forever)")
+    sp_mon.add_argument("--ws", action="store_true",
+                        help="event-driven WebSocket books (low latency)")
 
     sp_run = sub.add_parser("run", help="monitor + execute")
     add_scan_args(sp_run)
     sp_run.add_argument("--interval", type=float, default=5.0)
     sp_run.add_argument("--duration", type=float, default=None)
+    sp_run.add_argument("--ws", action="store_true",
+                        help="event-driven WebSocket books (low latency)")
     mode = sp_run.add_mutually_exclusive_group(required=True)
     mode.add_argument("--paper", action="store_true", help="simulated fills")
     mode.add_argument("--live", action="store_true",
@@ -63,12 +67,16 @@ def build_parser() -> argparse.ArgumentParser:
                         help="risk: max $ per trade")
     sp_run.add_argument("--max-daily", type=float, default=500.0,
                         help="risk: max $ per UTC day")
+    sp_run.add_argument("--cooldown", type=float, default=900.0,
+                        help="risk: seconds before re-trading the same event "
+                             "(your fill consumes the mispricing; paper fills "
+                             "don't, so keep this high for honest paper P&L)")
 
     sub.add_parser("report", help="summarize the opportunity/execution ledger")
     return p
 
 
-def make_scanner(args, executor=None, risk=None) -> Scanner:
+def make_scanner(args, executor=None, risk=None):
     det = DetectorConfig(
         min_edge_per_share=args.min_edge,
         min_profit_usd=args.min_profit,
@@ -82,7 +90,19 @@ def make_scanner(args, executor=None, risk=None) -> Scanner:
         min_liquidity=args.min_liquidity,
         interval_s=getattr(args, "interval", 5.0),
     )
-    return Scanner(
+    cls = Scanner
+    if getattr(args, "ws", False):
+        from .ws_scanner import WSScanner
+
+        cls = WSScanner
+        return cls(
+            detector_cfg=det,
+            scanner_cfg=scfg,
+            ledger=Ledger(args.data_dir),
+            risk=risk or RiskManager(),
+            executor=executor,
+        )
+    return cls(
         detector_cfg=det,
         scanner_cfg=scfg,
         ledger=Ledger(args.data_dir),
@@ -116,6 +136,7 @@ def main(argv: list[str] | None = None) -> int:
         risk = RiskManager(RiskConfig(
             max_notional_per_trade=args.max_trade,
             max_daily_notional=args.max_daily,
+            event_cooldown_s=args.cooldown,
         ))
         if args.live:
             from .execution import LiveExecutor  # heavy import, gated

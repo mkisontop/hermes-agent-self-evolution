@@ -7,7 +7,12 @@ import time
 from dataclasses import dataclass, field
 
 from .clob import ClobClient
-from .detector import DetectorConfig, detect_negrisk_event, prefilter_negrisk
+from .detector import (
+    DetectorConfig,
+    detect_negrisk_event,
+    event_tightness,
+    prefilter_negrisk,
+)
 from .gamma import GammaClient
 from .ledger import Ledger
 from .models import NegRiskEvent, Opportunity
@@ -55,6 +60,9 @@ class Scanner:
             opportunities.extend(
                 detect_negrisk_event(ev, books, self.detector_cfg)
             )
+            tight = event_tightness(ev, books, self.detector_cfg)
+            if tight is not None:
+                self.ledger.log_tightness(tight)
         opportunities.sort(key=lambda o: o.profit, reverse=True)
         for opp in opportunities:
             self.ledger.log_opportunity(opp)

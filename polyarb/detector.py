@@ -27,7 +27,14 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
-from .arbmath import NO_FEES, BasketFill, FeeParams, mirror_ladder, walk_buy_basket
+from .arbmath import (
+    NO_FEES,
+    BasketFill,
+    FeeParams,
+    mirror_ladder,
+    taker_fee_per_share,
+    walk_buy_basket,
+)
 from .models import (
     ArbKind,
     Leg,
@@ -256,6 +263,53 @@ def detect_binary_crossed(
         ["crossed book on a single binary market — likely stale data; "
          "verify before trusting"],
     )
+
+
+def event_tightness(
+    event: NegRiskEvent,
+    books: dict[str, OrderBook],
+    cfg: DetectorConfig,
+) -> dict | None:
+    """How close this event is to an arb right now (for the ledger).
+
+    Recorded every cycle for prefiltered events so a paper run yields an
+    edge *distribution* (how tight do baskets get, how often, in which
+    events) rather than just a count of full triggers.
+    """
+    markets = [m for m in event.markets if m.tradable]
+    n = len(markets)
+    if n < 2:
+        return None
+    stats = {"asks": 0.0, "bids": 0.0, "fee_ask": 0.0, "fee_bid": 0.0,
+             "depth_ask": float("inf"), "depth_bid": float("inf")}
+    for m in markets:
+        b = books.get(m.yes_token_id)
+        if b is None or not b.asks or not b.bids:
+            return None
+        fee = taker_fees(m)
+        a, bd = b.asks[0], b.bids[0]
+        stats["asks"] += a.price
+        stats["bids"] += bd.price
+        stats["fee_ask"] += taker_fee_per_share(a.price, fee)
+        stats["fee_bid"] += taker_fee_per_share(1.0 - bd.price, fee)
+        stats["depth_ask"] = min(stats["depth_ask"], a.size)
+        stats["depth_bid"] = min(stats["depth_bid"], bd.size)
+    # net edge per share if we fired at best levels right now
+    long_yes_edge = 1.0 - stats["asks"] - stats["fee_ask"]
+    long_no_edge = (n - 1.0) - (n - stats["bids"]) - stats["fee_bid"]
+    return {
+        "event_id": event.event_id,
+        "title": event.title[:60],
+        "n": n,
+        "sum_ask": round(stats["asks"], 4),
+        "sum_bid": round(stats["bids"], 4),
+        "long_yes_edge": round(long_yes_edge, 5),
+        "long_no_edge": round(long_no_edge, 5),
+        "top_depth_ask": round(stats["depth_ask"], 1),
+        "top_depth_bid": round(stats["depth_bid"], 1),
+        "augmented": event.augmented,
+        "complete": event.complete_for_long_yes,
+    }
 
 
 # ---------------------------------------------------------------------------
