@@ -71,6 +71,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="risk: seconds before re-trading the same event "
                              "(your fill consumes the mispricing; paper fills "
                              "don't, so keep this high for honest paper P&L)")
+    sp_run.add_argument("--fill-delay-ms", type=float, default=0.0,
+                        help="paper+--ws only: re-check LIVE books this many "
+                             "ms after detection and fill against what is "
+                             "still there (latency-honest shadow fills)")
 
     sub.add_parser("report", help="summarize the opportunity/execution ledger")
     return p
@@ -145,9 +149,19 @@ def main(argv: list[str] | None = None) -> int:
             print("*** LIVE TRADING ENABLED — real orders will be posted ***")
         else:
             executor = PaperExecutor()
-        make_scanner(args, executor=executor, risk=risk).run(
-            duration_s=args.duration
-        )
+        scanner = make_scanner(args, executor=executor, risk=risk)
+        if (
+            not args.live
+            and getattr(args, "ws", False)
+            and getattr(args, "fill_delay_ms", 0) > 0
+        ):
+            from .execution import DelayedPaperExecutor
+
+            scanner.executor = DelayedPaperExecutor(
+                book_provider=lambda: scanner._store,
+                delay_ms=args.fill_delay_ms,
+            )
+        scanner.run(duration_s=args.duration)
         return 0
     return 1
 

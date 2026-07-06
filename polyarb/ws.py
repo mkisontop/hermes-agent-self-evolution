@@ -78,6 +78,12 @@ class BookStore:
             conn = self._conn_of.get(yes_token)
             return bool(conn is not None and self._conn_ok.get(conn))
 
+    def resolve(self, token: str) -> tuple[str, bool]:
+        """Map any outcome token to (yes_token, is_mirrored)."""
+        with self._lock:
+            yes = self._no_to_yes.get(token, token)
+            return yes, yes != token
+
     def apply_snapshot(self, msg: dict) -> str | None:
         """Apply a full ``book`` event; returns the YES token updated."""
         asset = str(msg.get("asset_id", ""))

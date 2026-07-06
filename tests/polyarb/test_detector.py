@@ -323,3 +323,71 @@ class TestGammaParsing:
         assert by_title["complete"].complete_for_long_yes is True
         assert len(by_title["complete"].markets) == 2  # resolved leg excluded
         assert by_title["paused leg"].complete_for_long_yes is False
+
+
+class TestDelayedPaperExecutor:
+    def _store_with_book(self, asks):
+        from polyarb.ws import BookStore
+
+        st = BookStore()
+        st.register("yesA", "noA", conn_id=0)
+        st.set_conn_health(0, True)
+        st.apply_snapshot({
+            "asset_id": "yesA",
+            "bids": [{"price": "0.30", "size": "50"}],
+            "asks": [{"price": str(p), "size": str(s)} for p, s in reversed(asks)],
+            "timestamp": "1783333115465",
+        })
+        return st
+
+    def _opp(self, size=10.0, price=0.40):
+        from polyarb.models import Leg, Opportunity, Side
+
+        return Opportunity(
+            kind=ArbKind.NEGRISK_LONG_YES,
+            legs=[Leg("yesA", Side.BUY, price, size)],
+            size=size, gross_cost=price * size, payout=size, fees=0.0,
+            edge_per_share=1 - price, profit=(1 - price) * size,
+        )
+
+    def test_full_fill_when_depth_remains(self):
+        from polyarb.execution import DelayedPaperExecutor
+
+        st = self._store_with_book(asks=[(0.40, 20)])
+        ex = DelayedPaperExecutor(lambda: st, delay_ms=0)
+        res = ex.execute(self._opp(size=10, price=0.40))
+        assert res.success and res.legs[0].filled_size == 10
+
+    def test_partial_when_depth_gone(self):
+        from polyarb.execution import DelayedPaperExecutor
+
+        st = self._store_with_book(asks=[(0.40, 4)])
+        ex = DelayedPaperExecutor(lambda: st, delay_ms=0)
+        res = ex.execute(self._opp(size=10, price=0.40))
+        assert not res.success
+        assert res.legs[0].filled_size == pytest.approx(4)
+        assert "NOT fill" in res.note
+
+    def test_price_moved_above_limit_no_fill(self):
+        from polyarb.execution import DelayedPaperExecutor
+
+        st = self._store_with_book(asks=[(0.45, 100)])
+        ex = DelayedPaperExecutor(lambda: st, delay_ms=0)
+        res = ex.execute(self._opp(size=10, price=0.40))
+        assert not res.success and res.legs[0].filled_size == 0
+
+    def test_no_leg_fills_on_mirrored_token(self):
+        from polyarb.execution import DelayedPaperExecutor
+        from polyarb.models import Leg, Opportunity, Side
+
+        st = self._store_with_book(asks=[(0.40, 20)])
+        # NO ask ladder = mirror of YES bids: 0.70 x 50
+        opp = Opportunity(
+            kind=ArbKind.NEGRISK_LONG_NO,
+            legs=[Leg("noA", Side.BUY, 0.70, size=30)],
+            size=30, gross_cost=21.0, payout=0.0, fees=0.0,
+            edge_per_share=0.0, profit=0.0,
+        )
+        ex = DelayedPaperExecutor(lambda: st, delay_ms=0)
+        res = ex.execute(opp)
+        assert res.legs[0].filled_size == pytest.approx(30)

@@ -114,6 +114,74 @@ class PaperExecutor:
         )
 
 
+class DelayedPaperExecutor:
+    """Latency-honest paper fills: re-check the LIVE books after a delay.
+
+    Simulates the real order path: detection -> (signing + network +
+    matching latency) -> fill against whatever is resting *then*. Each
+    BUY leg fills only up to the size still available at or below its
+    limit price in the books ``delay_ms`` after detection. This measures
+    edge decay / adverse selection directly: if fills at delay 500ms
+    match fills at 0ms, latency is not the binding constraint.
+
+    ``book_provider()`` must return the live BookStore (WS mode).
+    """
+
+    mode = "paper-delayed"
+
+    def __init__(self, book_provider, delay_ms: float = 500.0):
+        self._provider = book_provider
+        self.delay_ms = delay_ms
+
+    def _available_at_limit(self, store, leg: Leg) -> float:
+        yes, mirrored = store.resolve(leg.token_id)
+        books = store.get_books([yes])
+        if books is None:
+            return 0.0
+        book = books[yes]
+        from .arbmath import mirror_ladder  # local: avoid cycle at import
+
+        ladder = mirror_ladder(book.bids) if mirrored else book.asks
+        avail = 0.0
+        for lv in ladder:
+            if lv.price > leg.price + 1e-9:
+                break
+            avail += lv.size
+        return avail
+
+    def execute(self, opp: Opportunity) -> ExecutionResult:
+        t0 = time.time()
+        if self.delay_ms > 0:
+            time.sleep(self.delay_ms / 1000.0)
+        store = self._provider()
+        legs = []
+        fillable = []
+        for leg in opp.legs:
+            avail = self._available_at_limit(store, leg)
+            frac = min(1.0, avail / leg.size) if leg.size > 0 else 0.0
+            fillable.append(frac)
+            legs.append(
+                LegResult(
+                    token_id=leg.token_id,
+                    ok=avail >= leg.size * 0.999,
+                    filled_size=min(avail, leg.size),
+                )
+            )
+        basket_frac = min(fillable) if fillable else 0.0
+        success = basket_frac >= 0.999
+        return ExecutionResult(
+            mode=self.mode,
+            success=success,
+            legs=legs,
+            started_at=t0,
+            elapsed_ms=(time.time() - t0) * 1000,
+            note=(
+                f"delay={self.delay_ms:.0f}ms basket_fillable={basket_frac:.3f}"
+                + ("" if success else " (FOK basket would NOT fill fully)")
+            ),
+        )
+
+
 def live_gate_open() -> bool:
     return (
         os.environ.get("POLYARB_MODE") == "live"
