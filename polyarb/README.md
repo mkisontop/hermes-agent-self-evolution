@@ -145,6 +145,42 @@ Live prerequisites (the bot does **not** do these for you):
    the kill-switch file (`polyarb.KILL`) and halts so a human decides
    whether to complete or unwind. Delete the file to resume.
 
+## Measured results (paper, July 6 2026, one hour, live markets)
+
+Two simultaneous paper runs over the same market window, same thresholds
+(min edge 0.2¢/share net of fees, min profit $0.05, $250 notional cap,
+800 events ≈ 180–236 negRisk events monitored):
+
+| | REST poller | WebSocket engine (`--ws`) |
+|---|---|---|
+| window | 60 min | 43 min |
+| effective detection latency | ~7.3s/cycle (2,316 books/cycle) | ~0.1s after a book change |
+| raw detections → episodes | 496 → **2** | 381 → **7** |
+| realizable profit (1 fill/episode, depth-true, net of fees) | **$5.21** | **$19.78** |
+| WS reconnects | — | 0 (407k events) |
+
+What the episodes were:
+
+- **Persistent fee-free geopolitics baskets** (both runs caught these):
+  "How many countries will Israel strike in 2026" — 12-leg long-YES
+  basket at 4.7–5.5% ROI that persisted the entire hour. Slow capital,
+  real edge, resolution-wording risk, locked until resolution.
+- **Flash mispricings** (WS-only): daily weather-bucket events
+  ("Highest temperature in Ankara") repricing violently — episodes
+  lasting 0–9 seconds at 1–18% ROI. A multi-second poller structurally
+  cannot trade these; this class is why the WS engine exists.
+- Baseline efficiency: of 180 events tightness-tracked every cycle for
+  the hour, only 2 ever went net-positive at top-of-book. The market is
+  picked clean where bots watch; the edge is in breadth + speed + fee
+  awareness.
+
+Honest read: ~$20–27/hour of *detected, depth-true, fee-net* paper edge
+at retail caps during one random Monday hour. Paper fills are optimistic
+(no slippage, no legging failures, no competition for the same depth),
+weather/geopolitics flow varies by news cycle, and long-YES baskets lock
+capital to resolution. Treat this as an upper bound and a reason to
+collect more data, not a promise.
+
 ## Measuring profitability (the actual "find a way" loop)
 
 1. `python -m polyarb monitor --min-edge 0.003 --min-profit 0.05` for
@@ -162,13 +198,20 @@ Live prerequisites (the bot does **not** do these for you):
 
 Ordered by measured impact per unit of work:
 
-- **WebSocket books** (`wss://ws-subscriptions-clob.polymarket.com/ws/market`)
-  with snapshot-on-reconnect + staleness watchdog — the 2026 opportunity
-  half-life (~seconds) makes 5s polling the binding constraint.
+- ~~WebSocket books~~ — **done** (`--ws`): sharded live L2 books,
+  event-driven detection; measured 3.8× the realizable episode profit
+  of REST polling on the same window (see results above).
+- **Pre-signed order ladders** — V2 orders are pre-signable (no nonce,
+  ms timestamp); Python EIP-712 signing costs ~1s/order, so the live
+  hot path must be HMAC + one batched HTTP/2 POST (`POST /orders`, ≤15
+  legs). This is the gap between detecting a 9-second flash and filling
+  it. See ADVANCED.md.
 - **NegRiskAdapter `convertPositions`** — realize long-NO baskets
   immediately instead of waiting for resolution (capital efficiency was
   the top wallet's core trick; "buying NO" was the single most
-  profitable strategy class at $17.3M/yr).
+  profitable strategy class at $17.3M/yr). Verified on-chain: adapter
+  fee 0, gas ≈165k per complement outcome (~$0.35 worst case). The
+  corridor is heavily botted (~967 conversions observed in 3h).
 - **CTF merge** for early exit of complete sets.
 - **Maker-side capture** — post inside the spread on both sides of
   near-inconsistent baskets so the *other* side pays the taker fee and
