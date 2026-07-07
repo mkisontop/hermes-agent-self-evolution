@@ -82,9 +82,14 @@ def taker_fees(m: MarketInfo) -> FeeParams:
 
 
 def _round_shares(shares: float, ndigits: int = 2) -> float:
-    """Round DOWN so we never ask for more than the book showed."""
+    """Round DOWN so we never ask for more than the book showed.
+
+    A tiny epsilon absorbs float noise (e.g. 4.9999999 that should be
+    5.00) so a share count sitting exactly on min_order_size isn't
+    truncated a full step below it and dropped.
+    """
     factor = 10**ndigits
-    return int(shares * factor) / factor
+    return int(shares * factor + 1e-6) / factor
 
 
 def _basket_to_opportunity(
@@ -117,6 +122,7 @@ def _basket_to_opportunity(
             market_question=markets[i].question,
             outcome=outcomes[i],
             condition_id=markets[i].condition_id,
+            tick_size=markets[i].tick_size,
         )
         for i in range(len(markets))
     ]
@@ -286,6 +292,9 @@ def event_tightness(
         b = books.get(m.yes_token_id)
         if b is None or not b.asks or not b.bids:
             return None
+        if b.age_seconds() > cfg.max_book_age_s:
+            return None  # stale books must not seed the edge ledger with
+            # tightness the detector itself would reject
         fee = taker_fees(m)
         a, bd = b.asks[0], b.bids[0]
         stats["asks"] += a.price

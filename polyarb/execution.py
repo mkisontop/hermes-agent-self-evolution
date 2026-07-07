@@ -201,6 +201,40 @@ class DelayedPaperExecutor:
         )
 
 
+def interpret_leg_response(resp: dict, side: Side, token_id: str) -> LegResult:
+    """Turn a CLOB post-order response into a LegResult — honestly.
+
+    FAK is immediate-or-cancel. ``success`` in the response only means the
+    request was ACCEPTED, not matched, so we key strictly off ``status``
+    and a parsed fill amount, and NEVER fabricate a fill. A "matched"
+    order with no reported size, or any non-matched terminal/pending state
+    ("delayed"/"live"/"unmatched"), returns ok=False so the caller's
+    partial-basket kill switch engages rather than assuming a fill we
+    cannot prove (a false full-fill would leave a naked leg unhedged and
+    feed the ledger/evolution loop fictitious P&L).
+    """
+    status = str(resp.get("status", "")).lower()
+    order_id = str(resp.get("orderID") or resp.get("orderId") or "")
+    raw_fill = (
+        resp.get("takingAmount") if side == Side.BUY else resp.get("makingAmount")
+    )
+    filled = 0.0
+    for cand in (raw_fill, resp.get("size_matched"), resp.get("sizeMatched")):
+        try:
+            filled = float(cand)
+            break
+        except (TypeError, ValueError):
+            continue
+    ok = status == "matched" and filled > 0
+    return LegResult(
+        token_id,
+        ok=ok,
+        filled_size=filled if ok else 0.0,
+        order_id=order_id,
+        error="" if ok else f"unfilled status={status or 'unknown'} fill={filled}",
+    )
+
+
 def live_gate_open() -> bool:
     return (
         os.environ.get("POLYARB_MODE") == "live"
@@ -260,7 +294,8 @@ class LiveExecutor:
         client.set_api_creds(client.create_or_derive_api_creds())
         return client, "v1"
 
-    def _post_leg(self, leg: Leg, neg_risk: bool, tick: float) -> LegResult:
+    def _post_leg(self, leg: Leg, neg_risk: bool, tick: float | None = None) -> LegResult:
+        tick = tick if tick is not None else leg.tick_size
         price, size = quantize_leg(leg.price, leg.size, tick)
         if size <= 0:
             return LegResult(leg.token_id, ok=False, error="size quantized to 0")
@@ -311,29 +346,25 @@ class LiveExecutor:
                 resp = self._client.post_order(signed, OrderType.FAK)
         except Exception as e:  # noqa: BLE001 — every leg error must be captured
             return LegResult(leg.token_id, ok=False, error=str(e)[:300])
-        resp = resp or {}
-        status = str(resp.get("status", "")).lower()
-        matched = status in ("matched", "success") or bool(resp.get("success"))
-        filled = float(resp.get("takingAmount") or resp.get("size_matched") or 0.0)
-        if matched and filled <= 0:
-            filled = size  # some responses omit fill size on full match
-        return LegResult(
-            leg.token_id,
-            ok=matched and filled > 0,
-            filled_size=filled,
-            order_id=str(resp.get("orderID") or resp.get("orderId") or ""),
-            error="" if matched else f"status={status or 'unknown'}",
-        )
+        return interpret_leg_response(resp or {}, leg.side, leg.token_id)
 
-    def execute(self, opp: Opportunity, tick: float = 0.001) -> ExecutionResult:
+    def execute(self, opp: Opportunity, tick: float | None = None) -> ExecutionResult:
         t0 = time.time()
         neg_risk = opp.kind.value.startswith("negrisk")
         with ThreadPoolExecutor(max_workers=min(16, len(opp.legs))) as pool:
+            # tick=None -> each leg quantizes with its own per-market tick
             results = list(
                 pool.map(lambda l: self._post_leg(l, neg_risk, tick), opp.legs)
             )
-        full = all(r.ok and math.isclose(r.filled_size, opp.size, rel_tol=0.05)
-                   for r in results)
+        # Compare fills to the QUANTIZED requested size per leg (flooring in
+        # quantize_leg can shave a step off opp.size), not the raw opp.size.
+        def leg_full(leg: Leg, r: LegResult) -> bool:
+            _, req = quantize_leg(leg.price, leg.size, tick or leg.tick_size)
+            return r.ok and req > 0 and math.isclose(
+                r.filled_size, req, rel_tol=1e-6, abs_tol=1e-6
+            )
+
+        full = all(leg_full(l, r) for l, r in zip(opp.legs, results))
         any_fill = any(r.ok and r.filled_size > 0 for r in results)
         note = ""
         if any_fill and not full:

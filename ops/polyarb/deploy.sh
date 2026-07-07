@@ -29,6 +29,9 @@ sudo -u polyarb git -C /opt/polyarb clone "$REPO_URL" repo 2>/dev/null \
 sudo -u polyarb python3 -m venv /opt/polyarb/venv
 sudo -u polyarb /opt/polyarb/venv/bin/pip install -q --upgrade pip
 sudo -u polyarb /opt/polyarb/venv/bin/pip install -q requests websockets
+# install the repo itself so `python -m polyarb` resolves (pyproject
+# packages polyarb* + evolution*); belt-and-braces with PYTHONPATH in the unit
+sudo -u polyarb /opt/polyarb/venv/bin/pip install -q -e /opt/polyarb/repo || true
 # live trading additionally needs: pip install py-clob-client-v2
 
 echo "== initial config (human baseline; ceilings live here) =="

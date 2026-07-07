@@ -15,23 +15,44 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 
-#: crude category classifier over event titles (good enough for mix drift)
-CATEGORY_KEYWORDS = {
-    "weather": ("temperature", "rain", "snow", "hottest", "weather"),
-    "sports": ("vs.", "cup", "league", "nba", "nfl", "mlb", "winner",
-               "champion", "match", "wimbledon"),
-    "geopolitics": ("strike", "war", "ceasefire", "nato", "sanction",
-                    "military", "hormuz", "missile"),
-    "politics": ("election", "president", "nominee", "minister",
-                 "parliament", "senate"),
-}
+#: crude category classifier over event titles (good enough for mix drift).
+#: Order is PRIORITY: geopolitics/politics/weather are checked before
+#: sports so that e.g. "Nobel Peace Prize Winner" or an election title is
+#: not swallowed by the generic sports word "winner". Keywords are matched
+#: on WORD BOUNDARIES (regex) so "war" doesn't match "warehouse", etc.
+CATEGORY_KEYWORDS = (
+    ("geopolitics", ("strike", "strikes", "war", "ceasefire", "nato",
+                     "sanction", "sanctions", "military", "hormuz",
+                     "missile", "missiles", "airstrike")),
+    ("politics", ("election", "president", "presidential", "nominee",
+                  "minister", "parliament", "parliamentary", "senate",
+                  "chancellor")),
+    ("weather", ("temperature", "rain", "snow", "hottest", "weather",
+                 "coldest", "rainfall")),
+    ("sports", ("cup", "league", "nba", "nfl", "mlb", "champion",
+                "champions", "match", "wimbledon", "semifinals",
+                "quarterfinals", "final", "finals")),
+)
+
+import re as _re
+
+_COMPILED = [
+    (cat, _re.compile(r"\b(?:" + "|".join(_re.escape(k) for k in kws) + r")\b"))
+    for cat, kws in CATEGORY_KEYWORDS
+]
 
 
 def classify(title: str) -> str:
     t = title.lower()
-    for cat, kws in CATEGORY_KEYWORDS.items():
-        if any(k in t for k in kws):
+    # sports vs. matchups: "X vs. Y" / "X vs Y" — checked after the more
+    # specific categories above so "USA vs. Iran" (geopolitical-sounding
+    # but a sports fixture) still lands in sports, while an election title
+    # never does.
+    for cat, rx in _COMPILED:
+        if rx.search(t):
             return cat
+    if _re.search(r"\bvs\.?\b", t):
+        return "sports"
     return "other"
 
 
@@ -112,9 +133,14 @@ def compute_drift(data_dirs: list[str], lookback_days: int = 14) -> DriftReport:
 
     report = DriftReport(days=sorted(slices.values(), key=lambda s: s.day))
 
-    # --- change detection: last day vs trailing mean of the rest ---
-    if len(report.days) >= 3:
-        *prior, last = report.days
+    # --- change detection: last COMPLETE day vs trailing mean of the rest ---
+    # The current UTC day is still accumulating; comparing a few morning
+    # hours against full prior days fires a spurious 'collapsed' flag on
+    # almost every nightly run. Compare only complete days.
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    complete = [d for d in report.days if d.day != today]
+    if len(complete) >= 3:
+        *prior, last = complete
         for metric, floor in (("detections", 5), ("episodes", 1),
                               ("total_profit", 0.5)):
             base = sum(getattr(d, metric) for d in prior) / len(prior)
@@ -130,7 +156,7 @@ def compute_drift(data_dirs: list[str], lookback_days: int = 14) -> DriftReport:
                     "(news regime or detector anomaly — verify before sizing up)"
                 )
         succ_rates = [
-            d.exec_success / d.executions for d in report.days if d.executions
+            d.exec_success / d.executions for d in complete if d.executions
         ]
         if len(succ_rates) >= 2 and succ_rates[-1] < 0.5 <= succ_rates[-2]:
             report.flags.append(

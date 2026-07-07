@@ -24,16 +24,23 @@ RECORDING_FLOOR_EDGE = 0.002
 RECORDING_FLOOR_PROFIT = 0.05
 
 #: gene -> (lo, hi, is_int). Risk genes get hi = min(hi, baseline value).
+#
+# Only parameters whose effect is HONESTLY SCORABLE from the journal are
+# evolvable. Deliberately excluded (kept fixed at the human baseline):
+#   * prefilter_slack — a pre-filter that changes WHICH events are
+#     recorded; replay can't see its effect, so evolving it against the
+#     journal is circular (dead gene).
+#   * event_cooldown_s — a live re-trade throttle; the re-clip fitness
+#     term is strictly monotone in it, so the optimizer would always
+#     drive it to the floor. It stays a human safety knob.
 GENE_BOUNDS: dict[str, tuple[float, float, bool]] = {
     "min_edge_per_share": (RECORDING_FLOOR_EDGE, 0.05, False),
     "safety_margin_per_share": (0.0, 0.01, False),
     "min_profit_usd": (RECORDING_FLOOR_PROFIT, 2.0, False),
-    "prefilter_slack": (0.01, 0.08, False),
     "max_legs": (4, 40, True),
     "max_notional_per_arb": (10.0, 250.0, False),
     "max_notional_per_trade": (10.0, 250.0, False),
     "max_daily_notional": (50.0, 2000.0, False),
-    "event_cooldown_s": (300.0, 7200.0, False),
 }
 
 #: genes where the baseline value is a hard ceiling (risk never rises)

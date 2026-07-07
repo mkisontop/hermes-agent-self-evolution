@@ -90,13 +90,34 @@ class TestReplayFitness:
         rep = evaluate(cfg, [ep(profit=2.0, cost=40.0)])
         assert rep.captured_profit == pytest.approx(1.0)  # half the clip
 
-    def test_reclips_decay(self):
-        cfg = TradingConfig(min_edge_per_share=0.002, min_profit_usd=0.05,
-                            event_cooldown_s=600)
-        one = evaluate(cfg, [ep(duration=0)]).captured_profit
-        many = evaluate(cfg, [ep(duration=1800)]).captured_profit  # 4 clips
-        expected = one * sum(RECLIP_DECAY**k for k in range(4))
-        assert many == pytest.approx(expected)
+    def test_single_capture_per_episode(self):
+        # a persisting episode is captured ONCE regardless of duration
+        # (no unverified-replenishment re-clips, no cooldown gradient)
+        cfg = TradingConfig(min_edge_per_share=0.002, min_profit_usd=0.05)
+        short = evaluate(cfg, [ep(duration=0)]).captured_profit
+        long = evaluate(cfg, [ep(duration=1800)]).captured_profit
+        assert short == pytest.approx(long) == pytest.approx(2.0)
+
+    def test_daily_notional_cap_binds(self):
+        # two $40-cost episodes same day; daily cap $60 -> second is
+        # partially funded ($20 of $40 cost), earlier episode gets budget first
+        cfg = TradingConfig(min_edge_per_share=0.002, min_profit_usd=0.01,
+                            max_notional_per_trade=250, max_notional_per_arb=250,
+                            max_daily_notional=60.0)
+        eps = [ep(profit=2.0, cost=40.0, eid="a"),
+               ep(profit=2.0, cost=40.0, eid="b")]
+        rep = evaluate(cfg, eps)
+        # a: full $40 (profit 2.0); b: $20/$40 scale -> profit 1.0
+        assert rep.capital_used == pytest.approx(60.0)
+        assert rep.captured_profit == pytest.approx(3.0)
+
+    def test_daily_cap_is_per_day(self):
+        cfg = TradingConfig(min_edge_per_share=0.002, min_profit_usd=0.01,
+                            max_daily_notional=40.0)
+        eps = [ep(profit=2.0, cost=40.0, day="2026-07-06", eid="a"),
+               ep(profit=2.0, cost=40.0, day="2026-07-07", eid="b")]
+        # each day has its own budget -> both captured fully
+        assert evaluate(cfg, eps).captured_profit == pytest.approx(4.0)
 
     def test_walk_forward_split_and_insufficient_data(self):
         cfg = TradingConfig(min_edge_per_share=0.002, min_profit_usd=0.05)

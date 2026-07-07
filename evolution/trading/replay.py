@@ -70,12 +70,19 @@ def load_episodes(data_dirs: list[str], gap_s: float = 60.0) -> list[EpisodeView
                     continue
     views: list[EpisodeView] = []
     for ep in Ledger.episodes(records, gap_s=gap_s):
-        # recover per-share edge and leg count from the best record
+        # Recover per-share edge / leg count / warned flag from the record
+        # that set this episode's max_profit. Bind WITHIN the episode's
+        # time window [start, start+duration] so two separate episodes of
+        # the same (event_id, kind) that happen to share a profit value
+        # can't cross-bind (which would import the wrong warned/legs data).
+        lo = ep["start"] - 1e-6
+        hi = ep["start"] + ep["duration_s"] + 1e-6
         best = None
         for r in records:
             if (
                 r.get("event_id") == ep["event_id"]
                 and r.get("kind") == ep["kind"]
+                and lo <= r.get("detected_at", -1) <= hi
                 and abs(r.get("profit", -1) - ep["max_profit"]) < 1e-9
             ):
                 best = r
@@ -116,34 +123,43 @@ class FitnessReport:
 def evaluate(cfg: TradingConfig, episodes: list[EpisodeView]) -> FitnessReport:
     rep = FitnessReport(n_episodes=len(episodes))
     hurdle = cfg.min_edge_per_share + cfg.safety_margin_per_share
-    for ep in episodes:
+    # per-day committed capital, so max_daily_notional is actually scored
+    # (a too-low daily cap forgoes later-in-day episodes)
+    spent_today: dict[str, float] = {}
+    # episodes captured in chronological order so the daily cap binds the
+    # way it would live (earlier episodes get the budget first)
+    for ep in sorted(episodes, key=lambda e: e.start):
         if ep.warned or ep.n_legs > cfg.max_legs:
             continue
         if ep.edge_per_share < hurdle:
             continue
-        # scale the clip to this config's notional caps
-        cap = min(cfg.max_notional_per_arb, cfg.max_notional_per_trade)
         if ep.cost_at_max <= 0:
             continue
+        # scale the clip to this config's per-trade notional cap
+        cap = min(cfg.max_notional_per_arb, cfg.max_notional_per_trade)
         scale = min(1.0, cap / ep.cost_at_max)
+        # ...then to the remaining daily budget
+        used = spent_today.get(ep.day, 0.0)
+        remaining = max(0.0, cfg.max_daily_notional - used)
+        if remaining <= 0:
+            continue
+        scale = min(scale, remaining / ep.cost_at_max)
         clip_profit = ep.max_profit * scale
         clip_cost = ep.cost_at_max * scale
         if clip_profit < cfg.min_profit_usd:
             continue
-        # re-clips within the episode, cooldown-limited, geometrically
-        # decayed for unverified depth replenishment
-        n_clips = 1 + int(ep.duration_s // max(cfg.event_cooldown_s, 60.0))
-        total = sum(
-            clip_profit * (RECLIP_DECAY**k) for k in range(min(n_clips, 8))
-        )
+        # ONE honest capture per episode: re-clipping a persisting episode
+        # assumes depth we never verified replenished, and made fitness
+        # monotone in a shorter cooldown. Count each episode once.
         lock_days = ASSUMED_LOCK_DAYS.get(ep.kind, 1.0)
         lockup = clip_cost * LOCKUP_DAILY_RATE * lock_days
-        rep.captured_profit += total
+        spent_today[ep.day] = used + clip_cost
+        rep.captured_profit += clip_profit
         rep.lockup_penalty += lockup
         rep.n_captured += 1
         rep.capital_used += clip_cost
         day = rep.by_day.setdefault(ep.day, {"profit": 0.0, "n": 0})
-        day["profit"] += total - lockup
+        day["profit"] += clip_profit - lockup
         day["n"] += 1
     rep.fitness = rep.captured_profit - rep.lockup_penalty
     return rep

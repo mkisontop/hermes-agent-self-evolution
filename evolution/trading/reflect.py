@@ -133,11 +133,67 @@ def call_llm(packet: dict, client=None, model: str | None = None) -> dict:
                   {"role": "user", "content": user}],
         temperature=0.2,
     )
-    text = resp.choices[0].message.content or ""
-    start, end = text.find("{"), text.rfind("}")
-    if start < 0 or end <= start:
-        raise ValueError(f"analyst returned no JSON object: {text[:200]!r}")
-    return json.loads(text[start:end + 1])
+    return _extract_json(resp.choices[0].message.content or "")
+
+
+def _extract_json(text: str) -> dict:
+    """Parse the analyst's JSON robustly.
+
+    ``find('{')..rfind('}')`` corrupts on any prose or rationale text that
+    itself contains braces. Instead: try a whole-text parse, then a fenced
+    ```json block, then a brace-depth scan that returns the first complete
+    top-level object.
+    """
+    text = text.strip()
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
+    except ValueError:
+        pass
+    import re
+
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    candidates = [fence.group(1)] if fence else []
+    depth = 0
+    start = -1
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start >= 0:
+                candidates.append(text[start:i + 1])
+    for c in candidates:
+        try:
+            obj = json.loads(c)
+            if isinstance(obj, dict):
+                return obj
+        except ValueError:
+            continue
+    raise ValueError(f"analyst returned no parseable JSON object: {text[:200]!r}")
+
+
+def notify_escalation(reason: str) -> None:
+    """Best-effort urgent push when the analyst escalates to a human."""
+    topic = os.environ.get("NTFY_TOPIC")
+    if not topic:
+        log.warning("escalation but NTFY_TOPIC unset: %s", reason)
+        return
+    try:
+        import requests
+
+        requests.post(
+            f"https://ntfy.sh/{topic}",
+            data=f"polyarb analyst escalation: {reason}"[:1000].encode(),
+            headers={"Priority": "urgent", "Tags": "warning",
+                     "Title": "polyarb escalation"},
+            timeout=10,
+        )
+    except Exception as e:  # noqa: BLE001 — never let alerting crash the pass
+        log.error("escalation push failed (%s): %s", e, reason)
 
 
 def sanitize_suggestion(
@@ -217,8 +273,11 @@ def run_reflection(args, client=None) -> int:
         return 0
 
     model = args.model or os.environ.get("POLYARB_LLM_MODEL", "gpt-5.4")
-    analysis = call_llm(packet, client=client, model=model)
+    # Record spend BEFORE the call: a call that connects then fails during
+    # streaming/parse has still consumed tokens, so the cost guard must
+    # count it (pessimistic) rather than let a crash-retry loop bypass it.
     _record_spend(args.data_dir[0], model, len(json.dumps(packet)))
+    analysis = call_llm(packet, client=client, model=model)
 
     # always persist the narrative for the human digest
     ts = time.strftime("%Y%m%d_%H%M%S")
@@ -234,7 +293,9 @@ def run_reflection(args, client=None) -> int:
             f.write(f"\n**ESCALATION**: {analysis.get('escalation_reason', '')}\n")
     print(f"reflection report: {report_path}")
     if analysis.get("escalate_to_human"):
-        print(f"ESCALATION: {analysis.get('escalation_reason', '')}")
+        reason = analysis.get("escalation_reason", "") or "(no reason given)"
+        print(f"ESCALATION: {reason}")
+        notify_escalation(reason)  # urgent ntfy push, best-effort
 
     # zero-trust path for the config suggestion
     cand, notes = sanitize_suggestion(analysis, baseline)

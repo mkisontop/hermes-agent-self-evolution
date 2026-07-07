@@ -85,9 +85,9 @@ def search(
                     {"ts": time.time(), "fitness": round(fit, 4),
                      "genes": {k: getattr(cand, k) for k in
                                ("min_edge_per_share", "safety_margin_per_share",
-                                "min_profit_usd", "prefilter_slack", "max_legs",
+                                "min_profit_usd", "max_legs",
                                 "max_notional_per_arb", "max_notional_per_trade",
-                                "max_daily_notional", "event_cooldown_s")}},
+                                "max_daily_notional")}},
                     separators=(",", ":")) + "\n")
             pool.append((fit, cand))
             pool.sort(key=lambda t: -t[0])
@@ -152,7 +152,15 @@ def run_evolution(args) -> int:
     ]
     constraints_ok = all(c.passed for c in constraints)
     gate = AutoMergeGate(min_improvement=args.min_improvement)
-    decision = gate.evaluate(base_train.fitness, cand_train.fitness, constraints_ok)
+    # Gate on OUT-OF-SAMPLE improvement (holdout), not the train fitness the
+    # search maximized — in-sample deltas are inflated by selection. With
+    # insufficient data (wf_warnings) there is no holdout, so we fall back
+    # to train but the failing walk_forward_data constraint forces
+    # constraints_ok=False, keeping auto_merge off (propose-only).
+    if wf_warnings:
+        decision = gate.evaluate(base_train.fitness, cand_train.fitness, constraints_ok)
+    else:
+        decision = gate.evaluate(base_hold.fitness, cand_hold.fitness, constraints_ok)
 
     record = build_proposal_record(
         skill_name="polyarb-config",
@@ -197,6 +205,18 @@ def run_evolution(args) -> int:
 
 def _apply_config_text(text: str, target: str) -> None:
     cfg = TradingConfig.from_dict(json.loads(text))  # validates keys
+    # Re-check gene bounds at APPLY time against the CURRENT live config as
+    # the ceiling — a proposal generated against an older baseline must not
+    # be able to raise a risk cap that was since lowered, and any
+    # hand-edited/corrupt proposal file is rejected here rather than trusted.
+    if Path(target).exists():
+        current = load_config(target)
+        problems = validate(cfg, current)
+        if problems:
+            raise ValueError(
+                f"refusing to apply: gene bounds violated vs live config: "
+                f"{problems}"
+            )
     cfg.version += 1
     ts = time.strftime("%Y%m%d_%H%M%S")
     target_p = Path(target)
@@ -212,7 +232,11 @@ def run_apply(args) -> int:
         log.error("proposal STATUS is %s, not APPROVED — refusing to apply", status)
         return 1
     evolved = (pdir / "evolved_skill.md").read_text()
-    _apply_config_text(evolved, args.baseline)
+    try:
+        _apply_config_text(evolved, args.baseline)
+    except ValueError as e:
+        log.error("%s", e)
+        return 1
     print(f"applied {pdir} -> {args.baseline} (running daemon hot-reloads "
           f"at next universe refresh)")
     return 0

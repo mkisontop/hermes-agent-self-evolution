@@ -146,6 +146,7 @@ class Leg:
     market_question: str = ""
     outcome: str = ""  # "YES" | "NO"
     condition_id: str = ""
+    tick_size: float = 0.001  # per-market; drives order quantization
 
     @property
     def notional(self) -> float:

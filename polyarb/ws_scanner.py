@@ -118,14 +118,21 @@ class WSScanner:
         self._wake.set()
 
     def _restart_feed(self) -> None:
-        if self._feed is not None:
-            self._feed.stop()
+        # Build the new universe (network I/O) BEFORE tearing down the old
+        # feed: if Gamma is unreachable and _build_universe raises, the old
+        # feed keeps running untouched, so run()'s "keeping old feed" branch
+        # is actually true. A stopped feed's store reports unhealthy (its
+        # _connection finally sets health False on cancellation), so books
+        # are never served stale-but-"healthy".
         subs = self._build_universe()
+        old = self._feed
         self._store = BookStore()
         self._feed = WSFeed(
             store=self._store, subscriptions=subs, on_update=self._on_update
         )
         self._feed.start()
+        if old is not None:
+            old.stop()
 
     # ------------------------------------------------------------------
     def _detect_event(self, ev_id: str) -> list[Opportunity]:
@@ -161,11 +168,16 @@ class WSScanner:
             )
 
     def _feed_healthy(self, grace_until: float) -> bool:
+        # Liveness is proven by ANY frame (PONGs arrive every ~8s even in a
+        # dead-quiet market), NOT by book updates — a quiet market with a
+        # healthy socket must not trip the systemd watchdog. Book staleness
+        # is a separate concern already enforced by BookStore health-gating
+        # of get_books, so trading never uses stale books regardless.
         if self._feed is None:
             return False
-        if self._feed.last_event_ts <= 0:
-            return time.time() < grace_until  # startup grace
-        return time.time() - self._feed.last_event_ts < 120.0
+        if self._feed.last_recv_ts <= 0:
+            return time.time() < grace_until  # startup grace before first frame
+        return time.time() - self._feed.last_recv_ts < 120.0
 
     def run(self, duration_s: float | None = None) -> None:
         from .sysd import sd_pet_watchdog, sd_ready, sd_status, sd_watchdog_interval_s
@@ -197,6 +209,9 @@ class WSScanner:
                     try:
                         self._apply_config_if_changed()
                         self._restart_feed()
+                        # the fresh feed needs time to receive its first
+                        # snapshot before the watchdog expects liveness
+                        grace_until = time.time() + 60.0
                     except Exception:  # noqa: BLE001
                         log.exception("universe refresh failed; keeping old feed")
                     next_refresh = time.time() + self.scanner_cfg.universe_refresh_s

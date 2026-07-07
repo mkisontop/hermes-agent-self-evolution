@@ -157,15 +157,23 @@ def main(argv: list[str] | None = None) -> int:
         make_scanner(args).run(duration_s=args.duration)
         return 0
     if args.cmd == "run":
-        risk = RiskManager(RiskConfig(
-            max_notional_per_trade=args.max_trade,
-            max_daily_notional=args.max_daily,
-            event_cooldown_s=args.cooldown,
-        ))
+        if getattr(args, "config", None):
+            # --config is authoritative for risk caps (that is where the
+            # evolution loop's tuned, human-approved caps live). CLI
+            # --max-trade/--max-daily/--cooldown are ignored so tuned caps
+            # actually apply; risk is built from the config in make_scanner.
+            risk = None
+        else:
+            risk = RiskManager(RiskConfig(
+                max_notional_per_trade=args.max_trade,
+                max_daily_notional=args.max_daily,
+                event_cooldown_s=args.cooldown,
+            ))
         if args.live:
             from .execution import LiveExecutor  # heavy import, gated
 
-            executor = LiveExecutor(kill_switch_file=risk.cfg.kill_switch_file)
+            kill_file = risk.cfg.kill_switch_file if risk else RiskConfig().kill_switch_file
+            executor = LiveExecutor(kill_switch_file=kill_file)
             print("*** LIVE TRADING ENABLED — real orders will be posted ***")
         else:
             executor = PaperExecutor()

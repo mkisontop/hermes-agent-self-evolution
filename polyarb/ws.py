@@ -174,6 +174,10 @@ class WSFeed:
     _thread: threading.Thread | None = None
     _stop: threading.Event = field(default_factory=threading.Event)
     stats: dict = field(default_factory=lambda: {"events": 0, "reconnects": 0})
+    #: last time ANY frame arrived (incl. PONG) — proves the socket is alive
+    #: even in a dead-quiet market; used for the systemd watchdog
+    last_recv_ts: float = 0.0
+    #: last time a book/price_change arrived — data freshness
     last_event_ts: float = 0.0
 
     def start(self) -> None:
@@ -221,8 +225,11 @@ class WSFeed:
                     await ws.send(json.dumps({"assets_ids": tokens, "type": "market"}))
                     last_msg = time.time()
                     last_ping = 0.0
-                    self.store.set_conn_health(conn_id, True)
                     backoff = 1.0
+                    # health stays False until the initial book snapshot(s)
+                    # arrive — a subscribed-but-not-yet-dumped connection
+                    # would otherwise serve empty/stale books as "healthy"
+                    got_snapshot = False
                     while not self._stop.is_set():
                         now = time.time()
                         if now - last_ping > PING_INTERVAL_S:
@@ -235,11 +242,14 @@ class WSFeed:
                         except asyncio.TimeoutError:
                             continue
                         last_msg = time.time()
+                        self.last_recv_ts = time.time()  # incl. PONG: socket alive
                         if raw == "PONG":
                             continue
-                        self._handle(raw)
+                        saw_book = self._handle(raw)
+                        if saw_book and not got_snapshot:
+                            got_snapshot = True
+                            self.store.set_conn_health(conn_id, True)
             except Exception as e:  # noqa: BLE001 — reconnect on anything
-                self.store.set_conn_health(conn_id, False)
                 self.stats["reconnects"] += 1
                 if not self._stop.is_set():
                     log.warning(
@@ -248,17 +258,25 @@ class WSFeed:
                     )
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 30.0)
+            finally:
+                # runs on disconnect AND on task cancellation
+                # (CancelledError bypasses `except Exception`) — a stopped
+                # or reconnecting feed must never report its books healthy
+                self.store.set_conn_health(conn_id, False)
 
-    def _handle(self, raw: str) -> None:
+    def _handle(self, raw: str) -> bool:
+        """Apply a frame; return True if it carried a book snapshot."""
         try:
             msg = json.loads(raw)
         except ValueError:
-            return
+            return False
         items = msg if isinstance(msg, list) else [msg]
         touched: set[str] = set()
+        saw_book = False
         for m in items:
             et = m.get("event_type")
             if et == "book":
+                saw_book = True
                 t = self.store.apply_snapshot(m)
                 if t:
                     touched.add(t)
@@ -274,3 +292,4 @@ class WSFeed:
         if self.on_update:
             for t in touched:
                 self.on_update(t)
+        return saw_book

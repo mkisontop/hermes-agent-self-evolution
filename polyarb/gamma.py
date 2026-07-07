@@ -46,11 +46,15 @@ def parse_market(m: dict, event: dict | None = None) -> MarketInfo | None:
     """Parse one Gamma market dict; None if it isn't CLOB-tradable."""
     token_ids = _parse_json_field(m.get("clobTokenIds"))
     outcomes = [str(o).lower() for o in _parse_json_field(m.get("outcomes"))]
+    outcome_prices = _parse_json_field(m.get("outcomePrices"))
     if len(token_ids) != 2:
         return None
-    # Binary markets are ["Yes","No"]; keep the token order aligned.
+    # Binary markets are ["Yes","No"]; align index 0 == YES across ALL
+    # index-aligned fields (tokens AND prices), so yes_price_hint and the
+    # complete_for_long_yes safety check read the YES price, not the NO price.
     if outcomes and outcomes[0] != "yes":
         token_ids = list(reversed(token_ids))
+        outcome_prices = list(reversed(outcome_prices))
     ev = event or {}
     fee_schedule = m.get("feeSchedule") or {}
     if isinstance(fee_schedule, str):
@@ -86,9 +90,7 @@ def parse_market(m: dict, event: dict | None = None) -> MarketInfo | None:
         active=bool(m.get("active", False)),
         closed=bool(m.get("closed", True)),
         yes_price_hint=(
-            _f(_parse_json_field(m.get("outcomePrices"))[0], None)
-            if _parse_json_field(m.get("outcomePrices"))
-            else None
+            _f(outcome_prices[0], None) if outcome_prices else None
         ),
     )
 

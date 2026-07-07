@@ -8,9 +8,11 @@ OnFailure=polyarb-alert@%n.service
 Type=oneshot
 User=polyarb
 Group=polyarb
-WorkingDirectory=/opt/polyarb
-ExecStart=/opt/polyarb/repo/ops/polyarb/nightly.sh
-Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/opt/polyarb/repo
+# load NTFY_TOPIC / POLYARB_NIGHTLY_HC / paths so the digest and the
+# healthchecks dead-man ping actually fire
+EnvironmentFile=-/etc/polyarb/env
+Environment=PYTHONUNBUFFERED=1 PYTHONPATH=/opt/polyarb/repo
 TimeoutStartSec=30min
 NoNewPrivileges=true
 ProtectSystem=strict

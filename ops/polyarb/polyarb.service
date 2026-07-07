@@ -11,18 +11,21 @@ Type=notify
 NotifyAccess=main
 User=polyarb
 Group=polyarb
-WorkingDirectory=/opt/polyarb
+WorkingDirectory=/opt/polyarb/repo
 # paper by default — go live ONLY by editing the env file (triple gate)
 EnvironmentFile=-/etc/polyarb/env
 ExecStart=/opt/polyarb/venv/bin/python -m polyarb \
     --data-dir /var/lib/polyarb/data \
     --config /var/lib/polyarb/polyarb.json \
     run --ws --paper --cooldown 900
-Environment=PYTHONUNBUFFERED=1 MALLOC_ARENA_MAX=2
+Environment=PYTHONUNBUFFERED=1 MALLOC_ARENA_MAX=2 PYTHONPATH=/opt/polyarb/repo
 
 Restart=always
 RestartSec=5
-StartLimitIntervalSec=0
+# bounded so a persistent start failure (e.g. bad deploy) reaches the
+# 'failed' state and fires OnFailure=; unbounded would crash-loop silently
+StartLimitIntervalSec=300
+StartLimitBurst=10
 WatchdogSec=90
 
 MemoryHigh=512M
