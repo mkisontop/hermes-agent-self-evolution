@@ -174,6 +174,7 @@ class WSFeed:
     _thread: threading.Thread | None = None
     _stop: threading.Event = field(default_factory=threading.Event)
     stats: dict = field(default_factory=lambda: {"events": 0, "reconnects": 0})
+    last_event_ts: float = 0.0
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, daemon=True, name="polyarb-ws")
@@ -269,6 +270,7 @@ class WSFeed:
             elif et == "tick_size_change":
                 pass  # tick handled at order time via market metadata
         self.stats["events"] += len(items)
+        self.last_event_ts = time.time()
         if self.on_update:
             for t in touched:
                 self.on_update(t)

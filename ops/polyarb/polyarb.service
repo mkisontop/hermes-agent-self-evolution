@@ -1,0 +1,61 @@
+# polyarb 24/7 daemon — install to /etc/systemd/system/polyarb.service
+# Hardened per polyarb/AUTONOMY.md. Requires: useradd -r -s /usr/sbin/nologin polyarb
+[Unit]
+Description=polyarb Polymarket arbitrage daemon
+After=network-online.target chrony.service
+Wants=network-online.target
+OnFailure=polyarb-alert@%n.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=polyarb
+Group=polyarb
+WorkingDirectory=/opt/polyarb
+# paper by default — go live ONLY by editing the env file (triple gate)
+EnvironmentFile=-/etc/polyarb/env
+ExecStart=/opt/polyarb/venv/bin/python -m polyarb \
+    --data-dir /var/lib/polyarb/data \
+    --config /var/lib/polyarb/polyarb.json \
+    run --ws --paper --cooldown 900
+Environment=PYTHONUNBUFFERED=1 MALLOC_ARENA_MAX=2
+
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+WatchdogSec=90
+
+MemoryHigh=512M
+MemoryMax=700M
+CPUQuota=80%
+TasksMax=256
+OOMPolicy=kill
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+UMask=0077
+StateDirectory=polyarb
+LogsDirectory=polyarb
+# live trading: store the key with systemd-creds encrypt (see AUTONOMY.md);
+# never put the private key in the env file
+# LoadCredentialEncrypted=evm_key:/etc/polyarb/evm_key.cred
+
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

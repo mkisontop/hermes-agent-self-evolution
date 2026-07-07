@@ -1,0 +1,11 @@
+# push alert on unit failure via ntfy.sh — set your topic in /etc/polyarb/env
+# (NTFY_TOPIC=polyarb-<long-random-string>)
+[Unit]
+Description=Push alert: %i failed
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/polyarb/env
+ExecStart=/bin/sh -c 'curl -fsS -m 10 -H "Priority: urgent" -H "Tags: skull" \
+    -d "$(hostname): %i entered failed state" \
+    "https://ntfy.sh/${NTFY_TOPIC:-polyarb-unconfigured}"'

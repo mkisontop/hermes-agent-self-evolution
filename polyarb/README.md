@@ -267,6 +267,16 @@ Ordered by measured impact per unit of work:
   contract-equivalence whitelist — resolution-criteria mismatch turns
   "riskless" into directional (see the Zelenskyy-suit UMA dispute).
 
+## Running it as an autonomous 24/7 self-evolving agent
+
+See **[AUTONOMY.md](AUTONOMY.md)**: two-loop architecture (dumb fast
+trading daemon + nightly journal-replay evolution emitting human-gated
+proposals through this repo's review pipeline), hardened systemd units
+and a one-shot `ops/polyarb/deploy.sh` for a $5 VPS, dead-man alerting,
+and the anti-self-deception gates the evolution loop enforces. The
+config file the daemon hot-reloads is the ONLY thing evolution can
+change, inside human-set ceilings.
+
 ## Risk disclaimers
 
 Resolution risk (UMA disputes can settle "obvious" markets the other

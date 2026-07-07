@@ -25,6 +25,9 @@ def build_parser() -> argparse.ArgumentParser:
         prog="polyarb", description="Polymarket negRisk arbitrage bot"
     )
     p.add_argument("--data-dir", default="polyarb_data", help="ledger directory")
+    p.add_argument("--config", default=None,
+                   help="TradingConfig JSON file (overrides scan-arg defaults; "
+                        "hot-reloaded by the --ws daemon at universe refresh)")
     p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -81,19 +84,35 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def make_scanner(args, executor=None, risk=None):
-    det = DetectorConfig(
-        min_edge_per_share=args.min_edge,
-        min_profit_usd=args.min_profit,
-        max_notional_per_arb=args.max_notional,
-        max_legs=args.max_legs,
-        prefilter_slack=args.prefilter_slack,
-        allow_augmented_long_yes=args.allow_augmented,
-    )
-    scfg = ScannerConfig(
-        max_events=args.max_events,
-        min_liquidity=args.min_liquidity,
-        interval_s=getattr(args, "interval", 5.0),
-    )
+    tcfg = None
+    if getattr(args, "config", None):
+        from .tuning import load_config
+
+        tcfg = load_config(args.config)
+    if tcfg is not None:
+        det = tcfg.to_detector_cfg()
+        det.allow_augmented_long_yes = args.allow_augmented
+        scfg = ScannerConfig(
+            max_events=tcfg.max_events,
+            min_liquidity=tcfg.min_liquidity,
+            interval_s=getattr(args, "interval", 5.0),
+        )
+        if risk is None:
+            risk = RiskManager(tcfg.to_risk_cfg())
+    else:
+        det = DetectorConfig(
+            min_edge_per_share=args.min_edge,
+            min_profit_usd=args.min_profit,
+            max_notional_per_arb=args.max_notional,
+            max_legs=args.max_legs,
+            prefilter_slack=args.prefilter_slack,
+            allow_augmented_long_yes=args.allow_augmented,
+        )
+        scfg = ScannerConfig(
+            max_events=args.max_events,
+            min_liquidity=args.min_liquidity,
+            interval_s=getattr(args, "interval", 5.0),
+        )
     cls = Scanner
     if getattr(args, "ws", False):
         from .ws_scanner import WSScanner
@@ -105,6 +124,7 @@ def make_scanner(args, executor=None, risk=None):
             ledger=Ledger(args.data_dir),
             risk=risk or RiskManager(),
             executor=executor,
+            config_path=getattr(args, "config", None),
         )
     return cls(
         detector_cfg=det,

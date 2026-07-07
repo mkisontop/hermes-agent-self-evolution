@@ -1,0 +1,11 @@
+[Unit]
+Description=Run polyarb nightly evolution at 03:17 UTC
+
+[Timer]
+OnCalendar=*-*-* 03:17:00 UTC
+RandomizedDelaySec=120
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

@@ -39,6 +39,8 @@ class WSScanner:
     max_tokens: int = 4000
     #: suppress duplicate ledger entries per (event, kind) within this window
     log_cooldown_s: float = 5.0
+    #: optional TradingConfig file — hot-reloaded at each universe refresh
+    config_path: str | None = None
 
     def __post_init__(self) -> None:
         self._events_by_id: dict[str, NegRiskEvent] = {}
@@ -53,6 +55,30 @@ class WSScanner:
         # which BookStore enforces. Disable the timestamp check.
         self._det_cfg = dataclasses.replace(
             self.detector_cfg, max_book_age_s=float("inf")
+        )
+        self._config_watcher = None
+        if self.config_path:
+            from .tuning import ConfigWatcher
+
+            self._config_watcher = ConfigWatcher(self.config_path)
+            self._apply_config_if_changed()
+
+    def _apply_config_if_changed(self) -> None:
+        if self._config_watcher is None:
+            return
+        cfg = self._config_watcher.poll()
+        if cfg is None:
+            return
+        self.detector_cfg = cfg.to_detector_cfg()
+        self._det_cfg = dataclasses.replace(
+            self.detector_cfg, max_book_age_s=float("inf")
+        )
+        self.risk.cfg = cfg.to_risk_cfg()
+        self.scanner_cfg.max_events = cfg.max_events
+        self.scanner_cfg.min_liquidity = cfg.min_liquidity
+        log.warning(
+            "trading config reloaded from %s (version=%s note=%r)",
+            self.config_path, cfg.version, cfg.note,
         )
 
     # ------------------------------------------------------------------
@@ -134,8 +160,21 @@ class WSScanner:
                 result.mode, opp.event_title, opp.profit, result.success,
             )
 
+    def _feed_healthy(self, grace_until: float) -> bool:
+        if self._feed is None:
+            return False
+        if self._feed.last_event_ts <= 0:
+            return time.time() < grace_until  # startup grace
+        return time.time() - self._feed.last_event_ts < 120.0
+
     def run(self, duration_s: float | None = None) -> None:
+        from .sysd import sd_pet_watchdog, sd_ready, sd_status, sd_watchdog_interval_s
+
         self._restart_feed()
+        sd_ready()
+        wd_interval = sd_watchdog_interval_s()
+        wd_next = 0.0
+        grace_until = time.time() + 60.0
         t_end = time.time() + duration_s if duration_s else None
         next_refresh = time.time() + self.scanner_cfg.universe_refresh_s
         n_detections = 0
@@ -143,9 +182,20 @@ class WSScanner:
         last_stats = time.time()
         try:
             while t_end is None or time.time() < t_end:
+                if wd_interval and time.time() >= wd_next:
+                    # pet the watchdog ONLY while the feed is healthy: a
+                    # silent WS freeze becomes an automatic restart
+                    if self._feed_healthy(grace_until):
+                        sd_pet_watchdog()
+                        sd_status(
+                            f"ws ok, {n_detections} detections, "
+                            f"{(self._feed.stats or {}).get('events', 0)} events"
+                        )
+                    wd_next = time.time() + wd_interval
                 if time.time() >= next_refresh:
                     log.info("refreshing universe + feed")
                     try:
+                        self._apply_config_if_changed()
                         self._restart_feed()
                     except Exception:  # noqa: BLE001
                         log.exception("universe refresh failed; keeping old feed")
