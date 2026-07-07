@@ -181,6 +181,48 @@ weather/geopolitics flow varies by news cycle, and long-YES baskets lock
 capital to resolution. Treat this as an upper bound and a reason to
 collect more data, not a promise.
 
+### Latency-honesty experiment (July 6–7 2026)
+
+Does the edge survive a realistic order path (sign + POST + match)?
+Two identical 75-min WS runs — one filling instantly at detection, one
+filling only against what the **live books offer 600ms later** (walking
+up while each marginal share stays profitable, like a real executor).
+Both runs produced the same 20 executions:
+
+| | instant | **600ms delayed** |
+|---|---|---|
+| realized profit | $18.57 | **$17.03 (91.7%)** |
+| full fills | 20/20 | 12/20 |
+
+Every miss was a micro-window (all under $0.62, live-sports/flash,
+$1.54 total). Every clip that mattered — the persistent geopolitics
+basket ($2.2–3.0 per clip, 6/6 full fills) and the weather ladders —
+filled completely; one filled *cheaper* than detected. An earlier
+stricter test (demanding the exact detected prices still rest) plus
+event forensics showed why: weather/sports ladders oscillate in and out
+of arb for hours (one event re-triggered 66 times over 81 min, later at
+$14), and the geopolitics basket replenished over ~2.5h while trading
+only 20 shares. **Conclusion: sub-second execution is sufficient;
+milliseconds are not required. The binding constraints are book depth
+and depth replenishment, not speed.**
+
+Supporting forensics: the flagship count-ladder basket was re-verified
+executable 2.5h after first detection (5.4% ROI, fee-free, complete
+0-to-15+ bucket set, and *resolution-ambiguity-immune* — a dispute over
+which count wins just moves which leg pays your $1); zero third-party
+trades printed during the biggest weather flash (nobody else harvested
+it); the weather-ladder universe is ~36–57 negRisk events/day across 63
+cities with ~$10M resting liquidity, recycling capital same-day.
+
+Realistic steady-state estimate at retail caps ($250/trade): the
+persistent class yields ~$2.5–3 per clip with hours-scale replenishment
+(a few clips/day), weather/sports add $1–15/day depending on flow —
+call it **$10–50/day (~$300–1,500/month) on a few thousand dollars of
+working capital**, before live frictions. Scaling past that requires
+maker-side capture (see ADVANCED.md), not more speed. Confidence rests
+on ~4h of instrumented observation across two days; run `monitor --ws`
+for 1–2 weeks to tighten it.
+
 ## Measuring profitability (the actual "find a way" loop)
 
 1. `python -m polyarb monitor --min-edge 0.003 --min-profit 0.05` for
@@ -203,9 +245,11 @@ Ordered by measured impact per unit of work:
   of REST polling on the same window (see results above).
 - **Pre-signed order ladders** — V2 orders are pre-signable (no nonce,
   ms timestamp); Python EIP-712 signing costs ~1s/order, so the live
-  hot path must be HMAC + one batched HTTP/2 POST (`POST /orders`, ≤15
-  legs). This is the gap between detecting a 9-second flash and filling
-  it. See ADVANCED.md.
+  hot path should be HMAC + one batched HTTP/2 POST (`POST /orders`,
+  ≤15 legs). Demoted from mandatory to optimization: the latency
+  experiment showed 92% of edge survives 600ms — signing in-line with
+  a warm session is good enough to start; pre-signing buys the last
+  $1.54/75min of micro-windows. See ADVANCED.md.
 - **NegRiskAdapter `convertPositions`** — realize long-NO baskets
   immediately instead of waiting for resolution (capital efficiency was
   the top wallet's core trick; "buying NO" was the single most
