@@ -1,0 +1,25 @@
+# weekly Hermes reflective pass — install to /etc/systemd/system/
+# Requires OPENAI_API_KEY (and optionally POLYARB_LLM_MODEL /
+# POLYARB_LLM_BASE_URL) in /etc/polyarb/env. Skipped harmlessly if unset.
+[Unit]
+Description=polyarb weekly Hermes reflection (LLM analyst, propose-only)
+After=polyarb-nightly.service
+OnFailure=polyarb-alert@%n.service
+
+[Service]
+Type=oneshot
+User=polyarb
+Group=polyarb
+WorkingDirectory=/opt/polyarb/repo
+EnvironmentFile=-/etc/polyarb/env
+Environment=PYTHONPATH=/opt/polyarb/repo PYTHONUNBUFFERED=1
+ExecStart=/opt/polyarb/venv/bin/python -m evolution.trading.reflect \
+    --baseline /var/lib/polyarb/polyarb.json \
+    --data-dir /var/lib/polyarb/data \
+    --proposals-dir /var/lib/polyarb/proposals
+TimeoutStartSec=10min
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+StateDirectory=polyarb

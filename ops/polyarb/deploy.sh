@@ -45,6 +45,10 @@ if [ ! -f /etc/polyarb/env ]; then
     cat > /etc/polyarb/env <<'EOF'
 # NTFY_TOPIC=polyarb-<long-random-string>
 # POLYARB_NIGHTLY_HC=https://hc-ping.com/<uuid>
+# --- weekly Hermes reflection (optional, ~2-10 USD/wk) ---
+# OPENAI_API_KEY=sk-...
+# POLYARB_LLM_MODEL=gpt-5.4
+# POLYARB_LLM_BASE_URL=
 # --- live trading triple gate (leave commented for paper) ---
 # POLYARB_MODE=live
 # LIVE_TRADING_ENABLED=true
@@ -92,10 +96,14 @@ echo "== systemd units =="
 cp /opt/polyarb/repo/ops/polyarb/polyarb.service \
    /opt/polyarb/repo/ops/polyarb/polyarb-nightly.service \
    /opt/polyarb/repo/ops/polyarb/polyarb-nightly.timer \
+   /opt/polyarb/repo/ops/polyarb/polyarb-reflect.service \
+   /opt/polyarb/repo/ops/polyarb/polyarb-reflect.timer \
    /opt/polyarb/repo/ops/polyarb/polyarb-alert@.service \
    /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now polyarb.service polyarb-nightly.timer
+# weekly LLM reflection: enable only after setting OPENAI_API_KEY in /etc/polyarb/env
+# systemctl enable --now polyarb-reflect.timer
 
 echo "== done =="
 systemctl --no-pager status polyarb.service | head -8

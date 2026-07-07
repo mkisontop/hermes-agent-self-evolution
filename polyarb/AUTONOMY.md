@@ -110,21 +110,49 @@ run it in a second paper daemon first, then live at 25% caps, then full.
   exfiltrating `.env` private keys — never run cloned bot code
   unaudited, pin dependencies.
 
-## The LLM's role (Hermes integration)
+## The third loop: Hermes reflection (implemented)
 
 All 2024–2026 evidence says autonomous LLM traders lose money (Alpha
 Arena: 4 of 6 frontier models lost >30% in two weeks) while
-propose-only, human-gated LLM reflection is the working pattern. So:
+propose-only, human-gated LLM reflection is the working pattern. So the
+LLM is a **scientist, not a trader**:
 
-- the numeric nightly loop uses **zero tokens** — profit is not spent
-  on inference;
-- optionally, a weekly Hermes/GEPA reflective pass reads the journals,
-  the trial registry, and the digest, and drafts *natural-language*
-  hypotheses ("weather flash frequency dropped after July 20 — likely
-  a new competitor; consider raising min_profit in weather") as
-  proposals through the same review queue. It has no write access to
-  config, bounds, or gates — identical trust level as the numeric loop:
-  none.
+```
+weekly (polyarb-reflect.timer, ~$2-10/run, spend-guarded):
+  signals.py   — numeric drift detection over the journals (per-day
+                 detections/episodes/edge/profit/exec-success/category
+                 mix + collapse/spike flags); zero tokens
+  reflect.py   — sends the ~1.5KB evidence packet (never raw journals)
+                 through the polyarb-analyst SKILL prompt to a frontier
+                 LLM (OPENAI_API_KEY / POLYARB_LLM_MODEL); receives
+                 structured JSON: summary, anomalies, causal hypotheses,
+                 optional config suggestion, escalation flag
+  zero-trust   — suggestion is clamped into gene bounds (risk ceilings
+                 cannot rise), capped at 3 genes, then scored by the
+                 SAME journal replay + walk-forward + AutoMergeGate as
+                 the numeric loop, and written as a PENDING proposal.
+                 A hallucinated or adversarial suggestion is
+                 mechanically incapable of reaching the live config.
+  narrative    — reflection-<ts>.md report + escalations for the human
+```
+
+What the LLM uniquely adds over the numeric loop: *causal* diagnosis
+(market regime change vs system degradation vs competitor arrival),
+narrative the human can act on, and escalation judgment. What it can
+never do: trade, raise risk, bypass gates, or spend unbounded tokens
+(one run per 6 days, packet size capped).
+
+**The elegant closure with this repo's mission**: the analyst's prompt
+is a standard skill file
+(`evolution/trading/skills/polyarb-analyst/SKILL.md`), so the existing
+GEPA skill-evolution machinery can evolve the *analyst itself* — using
+"were its proposals gate-passing and human-approved?" as fitness. Three
+loops, each evolving the layer below it, none touching money:
+
+1. fast loop trades (deterministic, evolves nothing)
+2. nightly numeric loop evolves the fast loop's config
+3. weekly Hermes loop reasons about both — and GEPA evolves the
+   Hermes loop's prompt
 
 ## Cost & expectation model
 
